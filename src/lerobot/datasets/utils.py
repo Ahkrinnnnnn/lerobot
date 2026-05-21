@@ -992,8 +992,8 @@ def validate_frame(frame: dict, features: dict) -> None:
     if "task" not in actual_features:
         raise ValueError("Feature mismatch in `frame` dictionary:\nMissing features: {'task'}\n")
 
-    # Remove task from actual_features for regular feature validation
-    actual_features_for_validation = actual_features - {"task"}
+    # DEFAULT_FEATURES (e.g. timestamp) are optional in the frame; add_frame pops them after validation.
+    actual_features_for_validation = actual_features - {"task"} - set(DEFAULT_FEATURES)
 
     error_message = validate_features_presence(actual_features_for_validation, expected_features)
 

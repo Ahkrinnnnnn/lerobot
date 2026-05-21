@@ -21,6 +21,7 @@
 
 import abc
 import logging
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -276,6 +277,8 @@ class MotorsBus(abc.ABC):
         self._model_nb_to_model_dict = {v: k for k, v in self.model_number_table.items()}
 
         self._validate_motors()
+        # Serial port is not thread-safe; sync_read/sync_write must not overlap (e.g. deploy fixed-rate sender).
+        self._io_lock = threading.RLock()
 
     def __len__(self):
         return len(self.motors)
@@ -1070,27 +1073,28 @@ class MotorsBus(abc.ABC):
 
         self._assert_protocol_is_compatible("sync_read")
 
-        names = self._get_motors_list(motors)
-        ids = [self.motors[motor].id for motor in names]
-        models = [self.motors[motor].model for motor in names]
+        with self._io_lock:
+            names = self._get_motors_list(motors)
+            ids = [self.motors[motor].id for motor in names]
+            models = [self.motors[motor].model for motor in names]
 
-        if self._has_different_ctrl_tables:
-            assert_same_address(self.model_ctrl_table, models, data_name)
+            if self._has_different_ctrl_tables:
+                assert_same_address(self.model_ctrl_table, models, data_name)
 
-        model = next(iter(models))
-        addr, length = get_address(self.model_ctrl_table, model, data_name)
+            model = next(iter(models))
+            addr, length = get_address(self.model_ctrl_table, model, data_name)
 
-        err_msg = f"Failed to sync read '{data_name}' on {ids=} after {num_retry + 1} tries."
-        ids_values, _ = self._sync_read(
-            addr, length, ids, num_retry=num_retry, raise_on_error=True, err_msg=err_msg
-        )
+            err_msg = f"Failed to sync read '{data_name}' on {ids=} after {num_retry + 1} tries."
+            ids_values, _ = self._sync_read(
+                addr, length, ids, num_retry=num_retry, raise_on_error=True, err_msg=err_msg
+            )
 
-        ids_values = self._decode_sign(data_name, ids_values)
+            ids_values = self._decode_sign(data_name, ids_values)
 
-        if normalize and data_name in self.normalized_data:
-            ids_values = self._normalize(ids_values)
+            if normalize and data_name in self.normalized_data:
+                ids_values = self._normalize(ids_values)
 
-        return {self._id_to_name(id_): value for id_, value in ids_values.items()}
+            return {self._id_to_name(id_): value for id_, value in ids_values.items()}
 
     def _sync_read(
         self,
@@ -1165,21 +1169,22 @@ class MotorsBus(abc.ABC):
                 f"{self.__class__.__name__}('{self.port}') is not connected. You need to run `{self.__class__.__name__}.connect()`."
             )
 
-        ids_values = self._get_ids_values_dict(values)
-        models = [self._id_to_model(id_) for id_ in ids_values]
-        if self._has_different_ctrl_tables:
-            assert_same_address(self.model_ctrl_table, models, data_name)
+        with self._io_lock:
+            ids_values = self._get_ids_values_dict(values)
+            models = [self._id_to_model(id_) for id_ in ids_values]
+            if self._has_different_ctrl_tables:
+                assert_same_address(self.model_ctrl_table, models, data_name)
 
-        model = next(iter(models))
-        addr, length = get_address(self.model_ctrl_table, model, data_name)
+            model = next(iter(models))
+            addr, length = get_address(self.model_ctrl_table, model, data_name)
 
-        if normalize and data_name in self.normalized_data:
-            ids_values = self._unnormalize(ids_values)
+            if normalize and data_name in self.normalized_data:
+                ids_values = self._unnormalize(ids_values)
 
-        ids_values = self._encode_sign(data_name, ids_values)
+            ids_values = self._encode_sign(data_name, ids_values)
 
-        err_msg = f"Failed to sync write '{data_name}' with {ids_values=} after {num_retry + 1} tries."
-        self._sync_write(addr, length, ids_values, num_retry=num_retry, raise_on_error=True, err_msg=err_msg)
+            err_msg = f"Failed to sync write '{data_name}' with {ids_values=} after {num_retry + 1} tries."
+            self._sync_write(addr, length, ids_values, num_retry=num_retry, raise_on_error=True, err_msg=err_msg)
 
     def _sync_write(
         self,

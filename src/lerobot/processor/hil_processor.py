@@ -15,18 +15,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
 import torch
 import torchvision.transforms.functional as F  # noqa: N812
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.teleoperators.teleoperator import Teleoperator
-from lerobot.teleoperators.utils import TeleopEvents
+
+
+if TYPE_CHECKING:
+    from lerobot.teleoperators.utils import TeleopEvents
+    from lerobot.teleoperators.teleoperator import Teleoperator
 
 from .core import EnvTransition, PolicyAction, TransitionKey
 from .pipeline import (
@@ -69,7 +74,7 @@ class HasTeleopEvents(Protocol):
 
 
 # Type variable constrained to Teleoperator subclasses that also implement events
-TeleopWithEvents = TypeVar("TeleopWithEvents", bound=Teleoperator)
+TeleopWithEvents = TypeVar("TeleopWithEvents", bound="Teleoperator")
 
 
 def _check_teleop_with_events(teleop: Teleoperator) -> None:

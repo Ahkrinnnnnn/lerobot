@@ -32,24 +32,20 @@ def precise_sleep(seconds: float, spin_threshold: float = 0.010, sleep_margin: f
         return
 
     system = platform.system()
-    # On macOS and Windows the scheduler / sleep granularity can make
-    # short sleeps inaccurate. Instead of burning CPU for the whole
-    # duration, sleep for most of the time and spin for the final few
-    # milliseconds to achieve good accuracy with much lower CPU usage.
-    if system in ("Darwin", "Windows"):
+    # Use "sleep most + short final spin" on all desktop OSes.
+    # This improves wake-up precision (including Linux) while keeping CPU
+    # usage moderate compared to full busy-waiting.
+    if system in ("Darwin", "Windows", "Linux"):
         end_time = time.perf_counter() + seconds
         while True:
             remaining = end_time - time.perf_counter()
             if remaining <= 0:
                 break
-            # If there's more than a couple milliseconds left, sleep most
-            # of the remaining time and leave a small margin for the final spin.
             if remaining > spin_threshold:
-                # Sleep but avoid sleeping past the end by leaving a small margin.
                 time.sleep(max(remaining - sleep_margin, 0))
             else:
-                # Final short spin to hit precise timing without long sleeps.
+                # Final short spin to avoid oversleep near the deadline.
                 pass
     else:
-        # On Linux time.sleep is accurate enough for most uses
+        # Fallback for other systems.
         time.sleep(seconds)

@@ -1,0 +1,199 @@
+Dataset modification:
+
+    Delete episodes 0, 2, and 5 from a dataset:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht \
+            --operation.type delete_episodes \
+            --operation.episode_indices "[0, 2, 5]"
+
+    Delete episodes and save to a new dataset:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht \
+            --new_repo_id lerobot/pusht_filtered \
+            --operation.type delete_episodes \
+            --operation.episode_indices "[0, 2, 5]"
+
+    Split dataset by fractions:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht \
+            --operation.type split \
+            --operation.splits '{"train": 0.8, "val": 0.2}'
+
+    Split dataset by episode indices:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht \
+            --operation.type split \
+            --operation.splits '{"train": [0, 1, 2, 3], "val": [4, 5]}'
+
+    Split into more than two splits:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht \
+            --operation.type split \
+            --operation.splits '{"train": 0.6, "val": 0.2, "test": 0.2}'
+
+    Merge multiple datasets:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht_merged \
+            --operation.type merge \
+            --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']"
+
+    Remove camera feature:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht \
+            --operation.type remove_feature \
+            --operation.feature_names "['observation.images.top']"
+
+    Convert image dataset to video format (saves locally):
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht_image \
+            --operation.type convert_to_video \
+            --operation.output_dir /path/to/output/pusht_video
+
+    Convert image dataset and save with new repo_id:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht_image \
+            --new_repo_id lerobot/pusht_video \
+            --operation.type convert_to_video
+
+    Convert and push to hub:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id lerobot/pusht_image \
+            --new_repo_id lerobot/pusht_video \
+            --operation.type convert_to_video \
+            --push_to_hub true
+
+    Using JSON config file:
+        python -m lerobot.scripts.lerobot_edit_dataset \
+            --config_path path/to/edit_config.json
+
+Teleoperate:
+
+    Example:
+
+    lerobot-teleoperate \
+        --robot.type=so101_follower \
+        --robot.port=/dev/ttyACM0 \
+        --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}" \
+        --robot.id=follower \
+        --teleop.type=so101_leader \
+        --teleop.port=/dev/ttyACM1 \
+        --teleop.id=leader \
+        --display_data=true
+
+    Example teleoperation with bimanual so100:
+
+    lerobot-teleoperate \
+    --robot.type=bi_so_follower \
+    --robot.left_arm_config.port=/dev/tty.usbmodem5A460822851 \
+    --robot.right_arm_config.port=/dev/tty.usbmodem5A460814411 \
+    --robot.id=bimanual_follower \
+    --robot.left_arm_config.cameras='{
+        wrist: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
+    }' --robot.right_arm_config.cameras='{
+        wrist: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
+    }' \
+    --teleop.type=bi_so_leader \
+    --teleop.left_arm_config.port=/dev/tty.usbmodem5A460852721 \
+    --teleop.right_arm_config.port=/dev/tty.usbmodem5A460819811 \
+    --teleop.id=bimanual_leader \
+    --display_data=true
+
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}" \
+    --robot.id=follower \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=leader \
+    --dataset.repo_id=dataset/data1 \
+    --dataset.num_episodes=2 \
+    --dataset.single_task="Grab the cube" \
+    --display_data=true \
+    --dataset.push_to_hub=false \
+    --dataset.episode_time_s=60 \
+    --dataset.reset_time_s=10 
+
+python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id dataset/complete_task \
+            --operation.type merge \
+            --operation.repo_ids "['dataset/complete_task_1', 'dataset/complete_task_2', 'dataset/complete_task_3']"
+
+
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/subtask_black_and_blue     --dataset.num_episodes=80     --dataset.single_task="Put the black objects to the left box and the blue objects to the right box"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/subtask_cube     --dataset.num_episodes=50     --dataset.single_task="Stack the cubes on the red mark"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/subtask_tube     --dataset.num_episodes=50     --dataset.single_task="Stack the tubes on the red mark"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/subtask_cube_and_tube     --dataset.num_episodes=80     --dataset.single_task="Stack the cubes and then the tubes separately on the red mark"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/subtask_cube_complete     --dataset.num_episodes=60     --dataset.single_task="Stack the cubes on the red mark, then put the black cube(s) to the left box and the blue cube(s) to the right box"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/subtask_tube_complete     --dataset.num_episodes=60     --dataset.single_task="Stack the tubes on the red mark, then put the black tube(s) to the left box and the blue tube(s) to the right box"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+lerobot-record     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.cameras="{ front: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}"     --robot.id=follower     --teleop.type=so101_leader     --teleop.port=/dev/ttyACM1     --teleop.id=leader     --dataset.repo_id=dataset/complete_task_1     --dataset.num_episodes=120     --dataset.single_task="Stack the cubes and then the tubes separately on the red mark, then put the black objects to the left box and the blue objects to the right box"     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=120     --dataset.reset_time_s=10
+
+
+
+lerobot-record  \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.cameras="{ up: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 16, width: 640, height: 480, fps: 30}}" \
+  --robot.id=follower \
+  --display_data=false \
+  --dataset.repo_id=eval_dataset/eval_so101 \
+  --dataset.single_task="Grab the black cube" \
+  --policy.path=pi0
+
+
+python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id dataset/base_task \
+            --operation.type merge \
+            --operation.repo_ids "['dataset/subtask_black', 'dataset/subtask_blue', 'dataset/subtask_cube', 'dataset/subtask_tube']"
+
+python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id dataset/sub_task \
+            --operation.type merge \
+            --operation.repo_ids "['dataset/subtask_black', 'dataset/subtask_blue', 'dataset/subtask_cube', 'dataset/subtask_tube', 'dataset/subtask_black_and_blue', 'dataset/subtask_cube_and_tube', 'dataset/subtask_cube_complete', 'dataset/subtask_tube_complete']"
+
+python -m lerobot.scripts.lerobot_edit_dataset \
+            --repo_id dataset/all_task \
+            --operation.type merge \
+            --operation.repo_ids "['dataset/subtask_black', 'dataset/subtask_blue', 'dataset/subtask_cube', 'dataset/subtask_tube', 'dataset/subtask_black_and_blue', 'dataset/subtask_cube_and_tube', 'dataset/subtask_cube_complete', 'dataset/subtask_tube_complete', 'dataset/complete_task']"
+
+python src/lerobot/scripts/lerobot_train.py \
+    --dataset.repo_id=dataset/base_task \
+    --policy.type=pi0 \
+    --output_dir=./outputs/pi0_training \
+    --job_name=pi0_training \
+    --policy.repo_id=pi0 \
+    --policy.compile_model=true \
+    --policy.gradient_checkpointing=true \
+    --policy.dtype=bfloat16 \
+    --policy.freeze_vision_encoder=false \
+    --policy.train_expert_only=false \
+    --steps=3000 \
+    --policy.device=cpu \
+    --batch_size=32
+    
+    
+    
+1. 末端增量控制
+
+    不采用绝对位置映射，而是基于外骨骼末端相对于启动遥操瞬间（或前一控制周期）的位移变化量进行控制。
+
+    系统检测操作者手部相对于参考位置的微小移动量（ΔX, ΔY, ΔZ 及旋转增量），将该增量作为指令发送给机器人。机器人的末端从当前位置出发，执行相同的位移增量（经缩放后）。
+
+
+2. 遥操启停
+    通过键盘按键切换遥操模式的开启与关闭。关闭时，机器人保持当前姿态并停止接收增量指令；开启时，系统重新设置增量参考位置（即当前外骨骼末端位置作为零点），避免开启瞬间的突变。
+
+3. 可调节的缩放因子
+
+    定义：一个可在线调整的系数 S，将操作者末端的物理位移增量映射为机器人末端的运动位移量。
+
+    映射公式：
+    机器人位移增量 = S × 操作者位移增量
+
+  S > 1：放大操作者动作
+
+  S < 1：缩小操作者动作
+
+    支持键盘按键（例如 + / –）实时增加或减小 S 值，并可显示当前值。
+
+    注意事项：缩放因子独立应用于平移，不影响旋转
