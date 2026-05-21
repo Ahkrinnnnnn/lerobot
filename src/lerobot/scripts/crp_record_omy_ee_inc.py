@@ -27,7 +27,7 @@ Control (episode-relative incremental; **OMY EE xyz uses the same frame as CRP**
 Gripper: unchanged — ``sensor_msgs/JointState`` + ``ros_gripper_joint_name`` → ``set_GOT`` /
 dataset ``gripper.pos`` via ``_omy_rh_r1_to_got0``.
 
-Multiprocessing (same idea as ``crp_record_omy.py``): a ``spawn`` worker owns ROS + polls EE / gripper at ``CRP_GP_STREAM_HZ``; a ``fork`` worker runs ``send_GPs`` + ``set_GOT`` at the same cadence so **camera / dataset fps does not throttle** arm commands. Main loop only copies ``omy_display_action`` for processors / logging.
+Multiprocessing: a ``spawn`` worker owns ROS + polls EE / gripper at ``CRP_GP_STREAM_HZ``; a ``fork`` worker runs ``send_GPs`` + ``set_GOT`` at the same cadence so **camera / dataset fps does not throttle** arm commands. Main loop only copies ``omy_display_action`` for processors / logging.
 
 Other teleops (non-OMY): GP command from ``ee.x`` … ``ee.yaw`` in the processed action dict, assumed already in the CRP frame (pass-through, no transform).
 

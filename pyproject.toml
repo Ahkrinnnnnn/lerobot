@@ -293,11 +293,10 @@ all = [
 [project.scripts]
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
 lerobot-camera-stream="lerobot.scripts.lerobot_camera_stream:main"
-lerobot-camera-streams-fps="lerobot.scripts.lerobot_camera_streams_fps:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"
 lerobot-record="lerobot.scripts.lerobot_record:main"
-lerobot-record-crp-omy="lerobot.scripts.crp_record_omy:main"
+lerobot-record-crp-omy="lerobot.scripts.crp_record_omy_ee_inc:main"
 lerobot-replay="lerobot.scripts.lerobot_replay:main"
 lerobot-setup-motors="lerobot.scripts.lerobot_setup_motors:main"
 lerobot-teleoperate="lerobot.scripts.lerobot_teleoperate:main"
