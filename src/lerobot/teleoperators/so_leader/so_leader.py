@@ -16,14 +16,13 @@
 
 import logging
 import time
-from typing import TypeAlias
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
     OperatingMode,
 )
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..teleoperator import Teleoperator
 from .config_so_leader import SOLeaderTeleopConfig
@@ -60,16 +59,14 @@ class SOLeader(Teleoperator):
 
     @property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        return self.action_features
 
     @property
     def is_connected(self) -> bool:
         return self.bus.is_connected
 
+    @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
-
         self.bus.connect()
         if not self.is_calibrated and calibrate:
             logger.info(
@@ -134,16 +131,20 @@ class SOLeader(Teleoperator):
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
+    def enable_torque(self) -> None:
+        self.bus.enable_torque()
+
+    def disable_torque(self) -> None:
+        self.bus.disable_torque()
+
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
+    @check_if_not_connected
     def get_action(self) -> dict[str, float]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
         start = time.perf_counter()
         action = self.bus.sync_read("Present_Position")
         action = {f"{motor}.pos": val for motor, val in action.items()}
@@ -151,17 +152,17 @@ class SOLeader(Teleoperator):
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
         return action
 
+    @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        goals = {k.removesuffix(".pos"): v for k, v in feedback.items() if k.endswith(".pos")}
+        if goals:
+            self.bus.sync_write("Goal_Position", goals)
 
+    @check_if_not_connected
     def disconnect(self) -> None:
-        if not self.is_connected:
-            DeviceNotConnectedError(f"{self} is not connected.")
-
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")
 
 
-SO100Leader: TypeAlias = SOLeader
-SO101Leader: TypeAlias = SOLeader
+SO100Leader = SOLeader
+SO101Leader = SOLeader

@@ -19,14 +19,15 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from lerobot.utils.import_utils import _reachy2_sdk_available
+from lerobot.utils.import_utils import _reachy2_sdk_available, require_package
 
 if TYPE_CHECKING or _reachy2_sdk_available:
     from reachy2_sdk import ReachySDK
 else:
     ReachySDK = None
 
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
 from .config_reachy2_teleoperator import Reachy2TeleoperatorConfig
@@ -83,6 +84,7 @@ class Reachy2Teleoperator(Teleoperator):
     name = "reachy2_specific"
 
     def __init__(self, config: Reachy2TeleoperatorConfig):
+        require_package("reachy2_sdk", extra="reachy2")
         super().__init__(config)
 
         self.config = config
@@ -126,10 +128,8 @@ class Reachy2Teleoperator(Teleoperator):
     def is_connected(self) -> bool:
         return self.reachy.is_connected() if self.reachy is not None else False
 
+    @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
-
         self.reachy = ReachySDK(self.config.ip_address)
 
         if not self.is_connected:
@@ -146,11 +146,9 @@ class Reachy2Teleoperator(Teleoperator):
     def configure(self) -> None:
         pass
 
+    @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
-
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         joint_action: dict[str, float] = {}
         vel_action: dict[str, float] = {}
