@@ -20,6 +20,7 @@ import logging
 import numpy as np
 
 from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.processor.relative_action_processor import get_relative_conversion_dim
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
@@ -661,8 +662,10 @@ def _compute_relative_chunk_batch(
     frame_idx = start_indices[:, None] + offsets[None, :]
     chunks = all_actions[frame_idx].copy()
     states = all_states[start_indices]
-    mask_dim = len(relative_mask)
-    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :]
+    rel_dim = get_relative_conversion_dim(states.shape[-1], len(relative_mask), chunks.shape[-1])
+    if rel_dim > 0:
+        m = relative_mask[:rel_dim].astype(np.float32)
+        chunks[:, :, :rel_dim] -= states[:, None, :rel_dim] * m[None, None, :]
     return chunks.reshape(-1, all_actions.shape[1])
 
 

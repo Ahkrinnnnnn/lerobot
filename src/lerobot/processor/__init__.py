@@ -90,6 +90,7 @@ from .relative_action_processor import (
     AbsoluteActionsProcessorStep,
     RelativeActionsProcessorStep,
     to_absolute_actions,
+    get_relative_conversion_dim,
     to_relative_actions,
 )
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
@@ -168,6 +169,7 @@ __all__ = [
     "transition_to_batch",
     "TransitionKey",
     "TruncatedProcessorStep",
+    "get_relative_conversion_dim",
     "to_absolute_actions",
     "to_relative_actions",
     "UnnormalizerProcessorStep",

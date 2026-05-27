@@ -55,6 +55,7 @@ from .inference import (
     SyncInferenceConfig,
     create_inference_engine,
 )
+from .inference.multiprocess_sync import MultiprocessSyncInferenceEngine
 from .robot_wrapper import ThreadSafeRobot
 
 logger = logging.getLogger(__name__)
@@ -410,22 +411,35 @@ def build_rollout_context(
         cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
     )
     task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
-    inference_strategy = create_inference_engine(
-        cfg.inference,
-        policy=policy,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        robot_wrapper=robot_wrapper,
-        hw_features=hw_features,
-        dataset_features=dataset_features,
-        ordered_action_keys=ordered_action_keys,
-        task=task_str,
-        fps=cfg.fps,
-        device=cfg.device,
-        use_torch_compile=cfg.use_torch_compile,
-        compile_warmup_inferences=cfg.compile_warmup_inferences,
-        shutdown_event=shutdown_event,
-    )
+    if cfg.multiprocess_sync_inference and isinstance(cfg.inference, SyncInferenceConfig):
+        logger.info("Creating MultiprocessSyncInferenceEngine (spawn subprocess)...")
+        inference_strategy = MultiprocessSyncInferenceEngine(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            dataset_features=dataset_features,
+            ordered_action_keys=ordered_action_keys,
+            task=task_str,
+            device=cfg.device,
+            robot_type=robot_wrapper.robot_type,
+        )
+    else:
+        inference_strategy = create_inference_engine(
+            cfg.inference,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            robot_wrapper=robot_wrapper,
+            hw_features=hw_features,
+            dataset_features=dataset_features,
+            ordered_action_keys=ordered_action_keys,
+            task=task_str,
+            fps=cfg.fps,
+            device=cfg.device,
+            use_torch_compile=cfg.use_torch_compile,
+            compile_warmup_inferences=cfg.compile_warmup_inferences,
+            shutdown_event=shutdown_event,
+        )
 
     # --- 8. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")

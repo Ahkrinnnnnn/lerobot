@@ -32,13 +32,22 @@ __all__ = [
     "MapTensorToDeltaActionDictStep",
     "RelativeActionsProcessorStep",
     "AbsoluteActionsProcessorStep",
+    "get_relative_conversion_dim",
     "to_relative_actions",
     "to_absolute_actions",
 ]
 
 
+def get_relative_conversion_dim(state_dim: int, mask_len: int, action_dim: int) -> int:
+    """How many leading action dims can use ``action - state`` (state must supply each index)."""
+    return min(int(state_dim), int(mask_len), int(action_dim))
+
+
 def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
     """Convert absolute actions to relative: relative = action - state (for masked dims).
+
+    When ``action_dim > state_dim`` (e.g. action includes gripper but state does not), only
+    indices ``i < state_dim`` with ``mask[i]`` are converted; trailing action dims stay absolute.
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
@@ -46,38 +55,47 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
         mask: Which dims to convert. Can be shorter than action_dim.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
+    rel_dim = get_relative_conversion_dim(state.shape[-1], mask_t.shape[0], actions.shape[-1])
+    if rel_dim == 0:
+        return actions.clone()
+    m = mask_t[:rel_dim]
     # Align state to the same device/dtype as actions. _last_state is cached before
     # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
+    state_offset = state[..., :rel_dim] * m
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
-    actions[..., :dims] -= state_offset
+    actions[..., :rel_dim] -= state_offset
     return actions
 
 
 def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
     """Convert relative actions back to absolute: absolute = relative + state (for masked dims).
 
+    When ``action_dim > state_dim``, only leading dims aligned with state are converted back;
+    trailing action dims are left unchanged (they were never made relative).
+
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
         state: (B, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
+    rel_dim = get_relative_conversion_dim(state.shape[-1], mask_t.shape[0], actions.shape[-1])
+    if rel_dim == 0:
+        return actions.clone()
+    m = mask_t[:rel_dim]
     # Align state to the same device/dtype as actions. _last_state is cached before
     # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
+    state_offset = state[..., :rel_dim] * m
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
-    actions[..., :dims] += state_offset
+    actions[..., :rel_dim] += state_offset
     return actions
 
 

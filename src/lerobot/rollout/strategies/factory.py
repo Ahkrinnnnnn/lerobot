@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from .base import BaseStrategy
 from .core import RolloutStrategy
 from .dagger import DAggerStrategy
+from .deploy import DeployStrategy
 from .highlight import HighlightStrategy
 from .sentry import SentryStrategy
 
@@ -36,10 +37,14 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
     """
     if config.type == "base":
         return BaseStrategy(config)
+    if config.type == "deploy":
+        return DeployStrategy(config)
     if config.type == "sentry":
         return SentryStrategy(config)
     if config.type == "highlight":
         return HighlightStrategy(config)
     if config.type == "dagger":
         return DAggerStrategy(config)
-    raise ValueError(f"Unknown strategy type '{config.type}'. Available: base, sentry, highlight, dagger")
+    raise ValueError(
+        f"Unknown strategy type '{config.type}'. Available: base, deploy, sentry, highlight, dagger"
+    )

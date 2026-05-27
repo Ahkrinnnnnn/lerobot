@@ -28,7 +28,7 @@ from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
-from .inference import InferenceEngineConfig, SyncInferenceConfig
+from .inference import InferenceEngineConfig, RTCInferenceConfig, SyncInferenceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,14 @@ class RolloutStrategyConfig(draccus.ChoiceRegistry, abc.ABC):
 @dataclass
 class BaseStrategyConfig(RolloutStrategyConfig):
     """Autonomous rollout with no data recording."""
+
+    pass
+
+
+@RolloutStrategyConfig.register_subclass("deploy")
+@dataclass
+class DeployStrategyConfig(RolloutStrategyConfig):
+    """Fixed-rate deployment with decoupled inference (``lerobot-deploy-v2``)."""
 
     pass
 
@@ -221,6 +229,10 @@ class RolloutConfig:
     torch_compile_mode: str = "default"
     compile_warmup_inferences: int = 2
 
+    # When True and ``--inference.type=sync``, run policy inference in a spawn
+    # subprocess so the control loop keeps a stable ``send_action`` rate.
+    multiprocess_sync_inference: bool = False
+
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
         # --- Strategy-specific validation ---
@@ -237,6 +249,11 @@ class RolloutConfig:
         if isinstance(self.strategy, BaseStrategyConfig) and self.dataset is not None:
             raise ValueError(
                 "Base strategy does not record data. Use sentry, highlight, or dagger for recording."
+            )
+
+        if isinstance(self.strategy, DeployStrategyConfig) and self.dataset is not None:
+            raise ValueError(
+                "Deploy strategy does not record data. Use sentry, highlight, or dagger for recording."
             )
 
         # Sentry MUST use streaming encoding to avoid disk I/O blocking the control loop
@@ -321,3 +338,23 @@ class RolloutConfig:
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
         return ["policy"]
+
+
+@dataclass
+class DeployV2Config(RolloutConfig):
+    """Top-level configuration for ``lerobot-deploy-v2``.
+
+    Fixed-rate real-robot deployment for ACT, SmolVLA, XVLA, Pi0, and related
+    policies.  Control frequency is **not** tied to ``train_config.json`` —
+    edit :attr:`fps` below or pass ``--fps=...`` on the CLI.
+    """
+
+    # Control frequency in Hz (robot ``send_action`` rate before interpolation).
+    fps: float = 30.0
+
+    strategy: RolloutStrategyConfig = field(default_factory=DeployStrategyConfig)
+
+    # Use ``--inference.type=rtc`` for slow VLAs (Pi0, SmolVLA, XVLA); ``sync`` for ACT.
+    inference: InferenceEngineConfig = field(default_factory=RTCInferenceConfig)
+
+    multiprocess_sync_inference: bool = True

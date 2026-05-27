@@ -17,6 +17,7 @@ from lerobot.datasets.compute_stats import get_feature_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.processor import TransitionKey, batch_to_transition
 from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+from lerobot.datasets.compute_stats import _compute_relative_chunk_batch
 from lerobot.processor.relative_action_processor import (
     AbsoluteActionsProcessorStep,
     RelativeActionsProcessorStep,
@@ -103,6 +104,41 @@ def test_exclude_joints_supports_partial_name_matching():
     ]
     step = RelativeActionsProcessorStep(enabled=True, exclude_joints=["gripper"], action_names=names)
     assert step._build_mask(len(names)) == [True, False, True, False]
+
+
+def test_action_wider_than_state_gripper_stays_absolute():
+    """action (7) with gripper, state (6) without — joints relative, gripper absolute."""
+    action_dim, state_dim = 7, 6
+    names = [f"j{i}.pos" for i in range(1, 7)] + ["gripper.pos"]
+    mask = RelativeActionsProcessorStep(
+        enabled=True, exclude_joints=["gripper"], action_names=names
+    )._build_mask(action_dim)
+
+    actions = torch.arange(4 * action_dim, dtype=torch.float32).reshape(4, action_dim) + 100.0
+    state = torch.arange(4 * state_dim, dtype=torch.float32).reshape(4, state_dim) + 10.0
+    gripper_abs = actions[:, 6].clone()
+
+    relative = to_relative_actions(actions, state, mask)
+    torch.testing.assert_close(relative[:, :6], actions[:, :6] - state)
+    torch.testing.assert_close(relative[:, 6], gripper_abs)
+
+    recovered = to_absolute_actions(relative, state, mask)
+    torch.testing.assert_close(recovered, actions)
+
+    # Vectorised stats path (recompute_stats batch kernel)
+    all_actions = actions.numpy()
+    all_states = state.numpy()
+    chunk_size = 3
+    batch = _compute_relative_chunk_batch(
+        np.array([0], dtype=np.int64),
+        all_actions,
+        all_states,
+        chunk_size=chunk_size,
+        relative_mask=np.array(mask, dtype=np.float32),
+    )
+    assert batch.shape == (chunk_size, action_dim)
+    np.testing.assert_allclose(batch[:, :6], relative.numpy()[:chunk_size, :6], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(batch[:, 6], gripper_abs.numpy()[:chunk_size], rtol=1e-5, atol=1e-5)
 
 
 # Chunk-level relative stats test
