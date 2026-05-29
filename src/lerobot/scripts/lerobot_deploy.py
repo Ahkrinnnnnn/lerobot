@@ -59,7 +59,7 @@ from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.utils import build_dataset_frame
+from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action
@@ -87,18 +87,15 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.utils.control_utils import (
+from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     predict_action,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.utils import (
-    get_safe_torch_device,
-    init_logging,
-    log_say,
-)
+from lerobot.utils.device_utils import get_safe_torch_device
+from lerobot.utils.utils import init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
@@ -619,7 +616,7 @@ def deploy(cfg: DeployConfig) -> None:
             len(robot_action_keys),
         )
 
-    policy = make_policy(cfg.policy, ds_meta=ds_meta)
+    policy = make_policy(cfg.policy, ds_meta=ds_meta, rename_map=cfg.rename_map)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
