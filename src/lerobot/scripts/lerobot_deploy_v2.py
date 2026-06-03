@@ -36,7 +36,7 @@ Usage examples
         --task="pick up cube" \\
         --fps=30
 
-    # Pi0 / SmolVLA / XVLA — RTC (recommended for slow VLAs)
+    # Pi0 / SmolVLA / XVLA — RTC in a spawn subprocess (isolated GIL, recommended)
     lerobot-deploy-v2 \\
         --policy.path=lerobot/pi0_base \\
         --inference.type=rtc \\

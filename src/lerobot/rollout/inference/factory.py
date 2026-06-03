@@ -34,6 +34,7 @@ from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
 from .base import InferenceEngine
+from .multiprocess_rtc import MultiprocessRTCInferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
@@ -66,12 +67,14 @@ class SyncInferenceConfig(InferenceEngineConfig):
 @InferenceEngineConfig.register_subclass("rtc")
 @dataclass
 class RTCInferenceConfig(InferenceEngineConfig):
-    """Real-Time Chunking: async policy inference in a background thread."""
+    """Real-Time Chunking: async policy inference isolated from the control-loop GIL."""
 
     # Eagerly constructed so draccus exposes nested fields directly on the CLI
     # (e.g. ``--inference.rtc.execution_horizon=...``).
     rtc: RTCConfig = field(default_factory=RTCConfig)
     queue_threshold: int = 30
+    # Run ``predict_action_chunk`` in a spawn subprocess (recommended for Pi0 / heavy VLAs).
+    multiprocess: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +113,10 @@ def create_inference_engine(
             robot_type=robot_wrapper.robot_type,
         )
     if isinstance(config, RTCInferenceConfig):
-        return RTCInferenceEngine(
+        rtc_kwargs = dict(
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
-            robot_wrapper=robot_wrapper,
             rtc_config=config.rtc,
             hw_features=hw_features,
             task=task,
@@ -124,5 +126,17 @@ def create_inference_engine(
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,
             shutdown_event=shutdown_event,
+        )
+        if config.multiprocess:
+            logger.info("Using MultiprocessRTCInferenceEngine (spawn subprocess)")
+            return MultiprocessRTCInferenceEngine(
+                **rtc_kwargs,
+                robot_type=robot_wrapper.robot_type,
+                action_feature_names=[k for k in ordered_action_keys if k.endswith(".pos")],
+            )
+        logger.info("Using RTCInferenceEngine (in-process thread)")
+        return RTCInferenceEngine(
+            **rtc_kwargs,
+            robot_wrapper=robot_wrapper,
         )
     raise ValueError(f"Unknown inference engine type: {type(config).__name__}")

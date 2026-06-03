@@ -241,12 +241,15 @@ class CRPArm(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        crp_raw = self.crp_arm_robot.read_joints()
-        joint_vec = _six_joint_values_from_sdk_dict(crp_raw)
-        for i in range(1, 7):
-            k = f"j{i}.pos"
-            if k in action:
-                joint_vec[i - 1] = float(action[k])
+        joint_keys = [f"j{i}.pos" for i in range(1, 7)]
+        if all(k in action for k in joint_keys):
+            joint_vec = [float(action[k]) for k in joint_keys]
+        else:
+            crp_raw = self.crp_arm_robot.read_joints()
+            joint_vec = _six_joint_values_from_sdk_dict(crp_raw)
+            for i, k in enumerate(joint_keys):
+                if k in action:
+                    joint_vec[i] = float(action[k])
 
         sent: dict[str, Any] = {f"j{i}.pos": joint_vec[i - 1] for i in range(1, 7)}
 

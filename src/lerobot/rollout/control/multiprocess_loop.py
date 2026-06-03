@@ -24,6 +24,7 @@ from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 
+from ..inference.multiprocess_rtc import MultiprocessRTCInferenceEngine
 from ..inference.multiprocess_sync import MultiprocessSyncInferenceEngine
 from ..inference.rtc import RTCInferenceEngine
 
@@ -32,6 +33,10 @@ if TYPE_CHECKING:
     from ..strategies.core import RolloutStrategy
 
 logger = logging.getLogger(__name__)
+
+
+def _is_rtc_engine(engine) -> bool:
+    return isinstance(engine, (RTCInferenceEngine, MultiprocessRTCInferenceEngine))
 
 
 def _get_robot_observation(robot, *, include_images: bool = True) -> dict[str, Any]:
@@ -73,7 +78,7 @@ def multiprocess_control_loop(
     shutdown = ctx.runtime.shutdown_event
 
     control_interval = interpolator.get_control_interval(cfg.fps)
-    is_rtc = isinstance(engine, RTCInferenceEngine)
+    is_rtc = _is_rtc_engine(engine)
     is_mp_sync = isinstance(engine, MultiprocessSyncInferenceEngine)
 
     engine.resume()
@@ -85,10 +90,11 @@ def multiprocess_control_loop(
     cached_obs_processed: dict | None = None
 
     logger.info(
-        "Multiprocess control loop started (fps=%.2f, interval=%.4fs, rtc=%s, mp_sync=%s)",
+        "Multiprocess control loop started (fps=%.2f, interval=%.4fs, rtc=%s, mp_rtc=%s, mp_sync=%s)",
         cfg.fps,
         control_interval,
         is_rtc,
+        isinstance(engine, MultiprocessRTCInferenceEngine),
         is_mp_sync,
     )
 
@@ -107,10 +113,19 @@ def multiprocess_control_loop(
                 continue
 
             if is_rtc:
-                obs_raw = robot.get_observation()
+                # Proprio-only every tick (fast path for send_action / hold-pose).
+                obs_raw = _get_robot_observation(robot, include_images=False)
                 obs_processed = processors.robot_observation_processor(obs_raw)
-                engine.notify_observation(obs_processed)
-                cached_obs_processed = obs_processed
+                # Full camera read + RTC notify only when a new policy action is needed
+                # (once per interpolation_multiplier ticks), matching deploy v1 throttling.
+                if interpolator.needs_new_action() or cached_obs_processed is None:
+                    try:
+                        obs_for_policy = _get_robot_observation(robot, include_images=True)
+                        obs_policy_processed = processors.robot_observation_processor(obs_for_policy)
+                        engine.notify_observation(obs_policy_processed)
+                        cached_obs_processed = obs_policy_processed
+                    except Exception as e:
+                        logger.warning("Failed to read policy observation for RTC: %s", e)
             else:
                 obs_raw = _get_robot_observation(robot, include_images=False)
                 obs_processed = processors.robot_observation_processor(obs_raw)
@@ -172,3 +187,6 @@ def multiprocess_control_loop(
                             control_interval * 1e3,
                             overruns,
                         )
+    finally:
+        engine.pause()
+        logger.info("Multiprocess control loop stopped (ticks=%d)", loop_i)

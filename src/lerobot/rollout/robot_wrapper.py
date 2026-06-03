@@ -39,9 +39,9 @@ class ThreadSafeRobot:
 
     # -- Lock-protected I/O --------------------------------------------------
 
-    def get_observation(self) -> dict[str, Any]:
+    def get_observation(self, **kwargs: Any) -> dict[str, Any]:
         with self._lock:
-            return self._robot.get_observation()
+            return self._robot.get_observation(**kwargs)
 
     def send_action(self, action: dict[str, Any] | Any) -> Any:
         with self._lock:

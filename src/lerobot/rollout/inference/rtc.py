@@ -62,6 +62,79 @@ _RTC_JOIN_TIMEOUT_S: float = 3.0
 # ---------------------------------------------------------------------------
 
 
+def _setup_relative_action_steps(
+    preprocessor: PolicyProcessorPipeline,
+    policy: PreTrainedPolicy,
+    action_feature_names: list[str] | None = None,
+) -> tuple[RelativeActionsProcessorStep | None, NormalizerProcessorStep | None]:
+    """Locate relative/normalizer processor steps and configure action names."""
+    relative_step = next(
+        (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
+        None,
+    )
+    normalizer_step = next(
+        (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
+        None,
+    )
+    if relative_step is not None and relative_step.action_names is None:
+        cfg_names = getattr(policy.config, "action_feature_names", None)
+        if cfg_names:
+            relative_step.action_names = list(cfg_names)
+        elif action_feature_names:
+            relative_step.action_names = list(action_feature_names)
+    return relative_step, normalizer_step
+
+
+def run_rtc_inference_step(
+    *,
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    obs: dict,
+    hw_features: dict,
+    task: str,
+    robot_type: str,
+    device: torch.device,
+    rtc_config: RTCConfig,
+    inference_delay: int,
+    prev_actions: torch.Tensor | None,
+    prev_abs: torch.Tensor | None,
+    relative_step: RelativeActionsProcessorStep | None,
+    normalizer_step: NormalizerProcessorStep | None,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Run one RTC forward pass. Returns ``(original, processed, latency_s)``."""
+    start = time.perf_counter()
+
+    obs_batch = build_dataset_frame(hw_features, obs, prefix="observation")
+    obs_batch = prepare_observation_for_inference(obs_batch, device, task, robot_type)
+    obs_batch["task"] = [task]
+
+    preprocessed = preprocessor(obs_batch)
+
+    rtc_prev = prev_actions
+    if rtc_prev is not None and relative_step is not None:
+        raw_state = relative_step.get_cached_state()
+        if raw_state is not None and prev_abs is not None and prev_abs.numel() > 0:
+            rtc_prev = reanchor_relative_rtc_prefix(
+                prev_actions_absolute=prev_abs,
+                current_state=raw_state,
+                relative_step=relative_step,
+                normalizer_step=normalizer_step,
+                policy_device=device,
+            )
+
+    if rtc_prev is not None:
+        rtc_prev = _normalize_prev_actions_length(rtc_prev, target_steps=rtc_config.execution_horizon)
+
+    actions = policy.predict_action_chunk(
+        preprocessed, inference_delay=inference_delay, prev_chunk_left_over=rtc_prev
+    )
+
+    original = actions.squeeze(0).clone()
+    processed = postprocessor(actions).squeeze(0)
+    return original, processed, time.perf_counter() - start
+
+
 def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int) -> torch.Tensor:
     """Pad or truncate RTC prefix actions to a fixed length for stable compiled inference."""
     if prev_actions.ndim != 2:
@@ -138,24 +211,11 @@ class RTCInferenceEngine(InferenceEngine):
                 compile_warmup_inferences,
             )
 
-        # Processor introspection for relative-action re-anchoring.
-        self._relative_step = next(
-            (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
-            None,
-        )
-        self._normalizer_step = next(
-            (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
-            None,
+        action_names = [k for k in robot_wrapper.action_features if k.endswith(".pos")]
+        self._relative_step, self._normalizer_step = _setup_relative_action_steps(
+            preprocessor, policy, action_feature_names=action_names
         )
         if self._relative_step is not None:
-            if self._relative_step.action_names is None:
-                cfg_names = getattr(policy.config, "action_feature_names", None)
-                if cfg_names:
-                    self._relative_step.action_names = list(cfg_names)
-                else:
-                    self._relative_step.action_names = [
-                        k for k in robot_wrapper.action_features if k.endswith(".pos")
-                    ]
             logger.info("Relative actions enabled: RTC prefix will be re-anchored")
 
     # ------------------------------------------------------------------
@@ -235,6 +295,12 @@ class RTCInferenceEngine(InferenceEngine):
             return None
         return self._action_queue.get()
 
+    def queue_size(self) -> int:
+        """Number of unconsumed actions in the RTC queue (0 if not started)."""
+        if self._action_queue is None:
+            return 0
+        return self._action_queue.qsize()
+
     def notify_observation(self, obs: dict) -> None:
         """Publish the latest observation for the RTC thread to consume."""
         with self._obs_lock:
@@ -269,48 +335,29 @@ class RTCInferenceEngine(InferenceEngine):
 
                 if queue.qsize() <= self._rtc_queue_threshold:
                     try:
-                        current_time = time.perf_counter()
                         idx_before = queue.get_action_index()
                         prev_actions = queue.get_left_over()
+                        prev_abs = queue.get_processed_left_over()
 
                         latency = latency_tracker.max()
                         delay = math.ceil(latency / time_per_chunk) if latency else 0
 
-                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
-                        obs_batch = prepare_observation_for_inference(
-                            obs_batch, policy_device, self._task, self._robot.robot_type
+                        original, processed, new_latency = run_rtc_inference_step(
+                            policy=self._policy,
+                            preprocessor=self._preprocessor,
+                            postprocessor=self._postprocessor,
+                            obs=obs,
+                            hw_features=self._hw_features,
+                            task=self._task,
+                            robot_type=self._robot.robot_type,
+                            device=policy_device,
+                            rtc_config=self._rtc_config,
+                            inference_delay=delay,
+                            prev_actions=prev_actions,
+                            prev_abs=prev_abs,
+                            relative_step=self._relative_step,
+                            normalizer_step=self._normalizer_step,
                         )
-                        obs_batch["task"] = [self._task]
-
-                        preprocessed = self._preprocessor(obs_batch)
-
-                        if prev_actions is not None and self._relative_step is not None:
-                            # Rebase against the raw cached state so the leftover tail stays in
-                            # the training-time coordinate frame.
-                            raw_state = self._relative_step.get_cached_state()
-                            if raw_state is not None:
-                                prev_abs = queue.get_processed_left_over()
-                                if prev_abs is not None and prev_abs.numel() > 0:
-                                    prev_actions = reanchor_relative_rtc_prefix(
-                                        prev_actions_absolute=prev_abs,
-                                        current_state=raw_state,
-                                        relative_step=self._relative_step,
-                                        normalizer_step=self._normalizer_step,
-                                        policy_device=policy_device,
-                                    )
-
-                        if prev_actions is not None:
-                            prev_actions = _normalize_prev_actions_length(
-                                prev_actions, target_steps=self._rtc_config.execution_horizon
-                            )
-
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
-                        )
-
-                        original = actions.squeeze(0).clone()
-                        processed = self._postprocessor(actions).squeeze(0)
-                        new_latency = time.perf_counter() - current_time
                         new_delay = math.ceil(new_latency / time_per_chunk)
 
                         inference_count += 1

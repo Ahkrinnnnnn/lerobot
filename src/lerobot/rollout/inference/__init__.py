@@ -26,12 +26,14 @@ from .factory import (
     create_inference_engine,
 )
 from .multiprocess_sync import MultiprocessSyncInferenceEngine
+from .multiprocess_rtc import MultiprocessRTCInferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
 __all__ = [
     "InferenceEngine",
     "InferenceEngineConfig",
+    "MultiprocessRTCInferenceEngine",
     "MultiprocessSyncInferenceEngine",
     "RTCInferenceConfig",
     "RTCInferenceEngine",

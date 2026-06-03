@@ -133,10 +133,9 @@ class PiGemmaRMSNorm(nn.Module):
         return f"dim={self.dim}, eps={self.eps}"
 
 
-def _get_pi_gemma_decoder_layer_base():
-    """base for PiGemmaDecoderLayer"""
+if TYPE_CHECKING or _transformers_available:
 
-    class _PiGemmaDecoderLayerBase(GradientCheckpointingLayer):
+    class PiGemmaDecoderLayerBase(GradientCheckpointingLayer):
         """Decoder layer that uses PiGemmaRMSNorm and _gated_residual, compatible with v5 Gemma."""
 
         def __init__(self, config: GemmaConfig, layer_idx: int):
@@ -187,7 +186,8 @@ def _get_pi_gemma_decoder_layer_base():
             hidden_states = _gated_residual(residual, hidden_states, gate)
             return hidden_states
 
-    return _PiGemmaDecoderLayerBase
+else:
+    PiGemmaDecoderLayerBase = None  # type: ignore[misc, assignment]
 
 
 class PiGemmaModel(GemmaModel):  # type: ignore[misc]
@@ -203,9 +203,8 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         # if not getattr(config, "use_adarms", False):
         #     return
         cond_dim = getattr(config, "adarms_cond_dim", None)
-        pi_gemma_decoder_layer_base = _get_pi_gemma_decoder_layer_base()
         self.layers = nn.ModuleList(
-            [pi_gemma_decoder_layer_base(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [PiGemmaDecoderLayerBase(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = PiGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
 
@@ -359,6 +358,7 @@ class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGenera
 
 
 __all__ = [
+    "PiGemmaDecoderLayerBase",
     "PiGemmaModel",
     "PiGemmaForCausalLM",
     "PiGemmaRMSNorm",

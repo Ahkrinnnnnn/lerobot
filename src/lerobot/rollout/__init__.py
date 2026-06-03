@@ -42,6 +42,7 @@ from .context import (
 from .inference import (
     InferenceEngine,
     InferenceEngineConfig,
+    MultiprocessRTCInferenceEngine,
     RTCInferenceConfig,
     RTCInferenceEngine,
     SyncInferenceConfig,
@@ -75,6 +76,7 @@ __all__ = [
     "HighlightStrategyConfig",
     "InferenceEngine",
     "InferenceEngineConfig",
+    "MultiprocessRTCInferenceEngine",
     "MultiprocessSyncInferenceEngine",
     "PolicyContext",
     "ProcessorContext",
