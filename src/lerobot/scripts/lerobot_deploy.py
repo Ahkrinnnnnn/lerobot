@@ -266,6 +266,35 @@ def _deploy_get_robot_observation(robot: Robot, *, include_images: bool = True) 
     return fn()
 
 
+def _enqueue_policy_observation_for_inference(
+    obs_queue: Any,
+    robot: Robot,
+    robot_io_lock: Any,
+    robot_observation_processor: RobotProcessorPipeline[
+        RobotObservation, RobotObservation
+    ],
+    frame_features: dict,
+) -> None:
+    """Capture cameras + proprio at the inference boundary and enqueue for the child process."""
+    with robot_io_lock:
+        obs_for_policy = _deploy_get_robot_observation(robot, include_images=True)
+    obs_policy_processed = robot_observation_processor(obs_for_policy)
+    observation_frame = build_dataset_frame(
+        frame_features, dict(obs_policy_processed), prefix=OBS_STR
+    )
+    try:
+        obs_queue.put_nowait(observation_frame)
+    except queue.Full:
+        try:
+            obs_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            obs_queue.put_nowait(observation_frame)
+        except queue.Full:
+            pass
+
+
 def _deploy_policy_dir_for_train_config(policy_pretrained: Path | str) -> Path:
     """Directory that contains ``train_config.json`` (checkpoint ``pretrained_model/`` or model root)."""
     p = Path(policy_pretrained).resolve()
@@ -311,8 +340,8 @@ def deploy_loop(
     """
     Fixed-rate control on the **main** process plus one **inference** subprocess (``spawn`` for CUDA).
 
-    The main process enqueues ``build_dataset_frame`` outputs when the queue accepts a new item;
-    the inference child never touches the robot (required for ``spawn`` + non-picklable SDK objects).
+    The main process enqueues ``build_dataset_frame`` outputs captured at the inference
+    boundary (immediately before each enqueue); the inference child never touches the robot.
     """
     policy.reset()
     if preprocessor is not None and postprocessor is not None:
@@ -361,17 +390,17 @@ def deploy_loop(
             daemon=True,
         )
         inference_process.start()
-    
+
         with robot_io_lock:
-            first_obs = _deploy_get_robot_observation(robot, include_images=True)
+            first_obs = _deploy_get_robot_observation(robot, include_images=False)
         first_obs_processed = robot_observation_processor(first_obs)
-        first_observation_frame = build_dataset_frame(
-            frame_features, dict(first_obs_processed), prefix=OBS_STR
+        _enqueue_policy_observation_for_inference(
+            obs_queue,
+            robot,
+            robot_io_lock,
+            robot_observation_processor,
+            frame_features,
         )
-        try:
-            obs_queue.put_nowait(first_observation_frame)
-        except queue.Full:
-            pass
         with latest_action_lock:
             first_policy_action = latest_action_ref["action"]
         if first_policy_action is not None and len(first_policy_action) == len(robot.action_features):
@@ -380,8 +409,7 @@ def deploy_loop(
             first_act_to_send = _current_pose_as_action(first_obs_processed, robot.action_features)
             if first_policy_action is None:
                 logging.warning(
-                    "Deploy[first_tick] first_policy_action=None first_obs_frame=%s first_act_hold=%s",
-                    _deploy_summarize_observation_frame_one_line(first_observation_frame),
+                    "Deploy[first_tick] first_policy_action=None first_act_hold=%s",
                     _deploy_format_action_dict(first_act_to_send),
                 )
             else:
@@ -438,21 +466,20 @@ def deploy_loop(
                 start_loop_t = time.perf_counter()
                 main_loop_i += 1
     
-                # Main reads proprio for control; full camera read + dataset frame happen here so the
-                # inference child only runs ``predict_action`` (spawn cannot unpickle CrpRobotPy).
+                # Main reads proprio for control; cameras are captured at the inference enqueue boundary.
                 with robot_io_lock:
                     obs = _deploy_get_robot_observation(robot, include_images=False)
                 obs_processed = robot_observation_processor(obs)
                 try:
-                    with robot_io_lock:
-                        obs_for_policy = _deploy_get_robot_observation(robot, include_images=True)
-                    obs_policy_processed = robot_observation_processor(obs_for_policy)
-                    observation_frame_q = build_dataset_frame(
-                        frame_features, dict(obs_policy_processed), prefix=OBS_STR
+                    _enqueue_policy_observation_for_inference(
+                        obs_queue,
+                        robot,
+                        robot_io_lock,
+                        robot_observation_processor,
+                        frame_features,
                     )
-                    obs_queue.put_nowait(observation_frame_q)
-                except queue.Full:
-                    pass
+                except Exception as e:
+                    logging.warning("Failed to enqueue policy observation for inference: %s", e)
     
                 with latest_action_lock:
                     policy_action = latest_action_ref["action"]

@@ -56,6 +56,7 @@ from .inference import (
     create_inference_engine,
 )
 from .inference.multiprocess_sync import MultiprocessSyncInferenceEngine
+from .obs_capture import make_policy_obs_capture_fn
 from .robot_wrapper import ThreadSafeRobot
 
 logger = logging.getLogger(__name__)
@@ -411,6 +412,7 @@ def build_rollout_context(
         cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
     )
     task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+    policy_obs_capture_fn = make_policy_obs_capture_fn(robot_wrapper, robot_observation_processor)
     if cfg.multiprocess_sync_inference and isinstance(cfg.inference, SyncInferenceConfig):
         logger.info("Creating MultiprocessSyncInferenceEngine (spawn subprocess)...")
         inference_strategy = MultiprocessSyncInferenceEngine(
@@ -439,6 +441,7 @@ def build_rollout_context(
             use_torch_compile=cfg.use_torch_compile,
             compile_warmup_inferences=cfg.compile_warmup_inferences,
             shutdown_event=shutdown_event,
+            policy_obs_capture_fn=policy_obs_capture_fn,
         )
 
     # --- 8. Assemble ---------------------------------------------------

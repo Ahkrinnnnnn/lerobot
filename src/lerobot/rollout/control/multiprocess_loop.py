@@ -113,19 +113,9 @@ def multiprocess_control_loop(
                 continue
 
             if is_rtc:
-                # Proprio-only every tick (fast path for send_action / hold-pose).
+                # Proprio-only every tick; policy cameras are read at the inference boundary.
                 obs_raw = _get_robot_observation(robot, include_images=False)
                 obs_processed = processors.robot_observation_processor(obs_raw)
-                # Full camera read + RTC notify only when a new policy action is needed
-                # (once per interpolation_multiplier ticks), matching deploy v1 throttling.
-                if interpolator.needs_new_action() or cached_obs_processed is None:
-                    try:
-                        obs_for_policy = _get_robot_observation(robot, include_images=True)
-                        obs_policy_processed = processors.robot_observation_processor(obs_for_policy)
-                        engine.notify_observation(obs_policy_processed)
-                        cached_obs_processed = obs_policy_processed
-                    except Exception as e:
-                        logger.warning("Failed to read policy observation for RTC: %s", e)
             else:
                 obs_raw = _get_robot_observation(robot, include_images=False)
                 obs_processed = processors.robot_observation_processor(obs_raw)
@@ -141,14 +131,16 @@ def multiprocess_control_loop(
                         logger.warning("Failed to enqueue observation for inference: %s", e)
 
             if interpolator.needs_new_action():
-                obs_for_frame = cached_obs_processed if cached_obs_processed is not None else obs_processed
-                obs_frame = build_dataset_frame(features, obs_for_frame, prefix=OBS_STR)
                 if is_rtc:
-                    action_tensor = engine.get_action(obs_frame)
-                elif is_mp_sync:
-                    action_tensor = engine.read_latest_action()
+                    # RTC pops from the action queue; policy obs are captured at the inference boundary.
+                    action_tensor = engine.get_action(None)
                 else:
-                    action_tensor = engine.get_action(obs_frame)
+                    obs_for_frame = cached_obs_processed if cached_obs_processed is not None else obs_processed
+                    obs_frame = build_dataset_frame(features, obs_for_frame, prefix=OBS_STR)
+                    if is_mp_sync:
+                        action_tensor = engine.read_latest_action()
+                    else:
+                        action_tensor = engine.get_action(obs_frame)
                 if action_tensor is not None:
                     interpolator.add(action_tensor)
 

@@ -26,6 +26,7 @@ import logging
 import math
 import time
 import traceback
+from collections.abc import Callable
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -91,7 +92,7 @@ def run_rtc_inference_step(
     preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
     obs: dict,
-    hw_features: dict,
+    dataset_features: dict,
     task: str,
     robot_type: str,
     device: torch.device,
@@ -105,7 +106,7 @@ def run_rtc_inference_step(
     """Run one RTC forward pass. Returns ``(original, processed, latency_s)``."""
     start = time.perf_counter()
 
-    obs_batch = build_dataset_frame(hw_features, obs, prefix="observation")
+    obs_batch = build_dataset_frame(dataset_features, obs, prefix="observation")
     obs_batch = prepare_observation_for_inference(obs_batch, device, task, robot_type)
     obs_batch["task"] = [task]
 
@@ -158,9 +159,9 @@ class RTCInferenceEngine(InferenceEngine):
     """Async RTC inference: a background thread produces action chunks.
 
     ``get_action`` pops the next action from the shared queue (or
-    returns ``None`` if the queue is empty).  The main loop should call
-    ``notify_observation`` every tick and ``pause``/``resume`` around
-    human-intervention phases.
+    returns ``None`` if the queue is empty).  When ``policy_obs_capture_fn``
+    is set, observations are captured at the inference boundary instead of
+    via ``notify_observation``.
     """
 
     def __init__(
@@ -170,7 +171,7 @@ class RTCInferenceEngine(InferenceEngine):
         postprocessor: PolicyProcessorPipeline,
         robot_wrapper: ThreadSafeRobot,
         rtc_config: RTCConfig,
-        hw_features: dict,
+        dataset_features: dict,
         task: str,
         fps: float,
         device: str | None,
@@ -178,13 +179,14 @@ class RTCInferenceEngine(InferenceEngine):
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
         shutdown_event: Event | None = None,
+        policy_obs_capture_fn: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
         self._robot = robot_wrapper
         self._rtc_config = rtc_config
-        self._hw_features = hw_features
+        self._dataset_features = dataset_features
         self._task = task
         self._fps = fps
         self._device = device or "cpu"
@@ -200,6 +202,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._shutdown_event = Event()
         self._rtc_error = Event()
         self._global_shutdown_event = shutdown_event
+        self._policy_obs_capture_fn = policy_obs_capture_fn
         self._rtc_thread: Thread | None = None
 
         if not self._use_torch_compile:
@@ -327,14 +330,21 @@ class RTCInferenceEngine(InferenceEngine):
                     continue
 
                 queue = self._action_queue
-                with self._obs_lock:
-                    obs = self._obs_holder.get("obs")
-                if queue is None or obs is None:
+                if queue is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
                 if queue.qsize() <= self._rtc_queue_threshold:
                     try:
+                        if self._policy_obs_capture_fn is not None:
+                            obs = self._policy_obs_capture_fn()
+                        else:
+                            with self._obs_lock:
+                                obs = self._obs_holder.get("obs")
+                            if obs is None:
+                                time.sleep(_RTC_IDLE_SLEEP_S)
+                                continue
+
                         idx_before = queue.get_action_index()
                         prev_actions = queue.get_left_over()
                         prev_abs = queue.get_processed_left_over()
@@ -347,7 +357,7 @@ class RTCInferenceEngine(InferenceEngine):
                             preprocessor=self._preprocessor,
                             postprocessor=self._postprocessor,
                             obs=obs,
-                            hw_features=self._hw_features,
+                            dataset_features=self._dataset_features,
                             task=self._task,
                             robot_type=self._robot.robot_type,
                             device=policy_device,
@@ -382,6 +392,10 @@ class RTCInferenceEngine(InferenceEngine):
 
                     except Exception as e:
                         consecutive_errors += 1
+                        if self._policy_obs_capture_fn is not None and consecutive_errors == 1:
+                            logger.warning(
+                                "Failed to capture policy observation at inference boundary: %s", e
+                            )
                         logger.error(
                             "RTC inference error (%d/%d): %s",
                             consecutive_errors,

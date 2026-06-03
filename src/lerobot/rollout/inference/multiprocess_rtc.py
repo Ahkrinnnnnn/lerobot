@@ -23,6 +23,7 @@ import queue
 import time
 import traceback
 from threading import Event, Lock, Thread
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -58,7 +59,7 @@ def _rtc_subprocess_worker(
     policy: PreTrainedPolicy,
     preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
-    hw_features: dict,
+    dataset_features: dict,
     task: str,
     robot_type: str,
     device,
@@ -102,7 +103,7 @@ def _rtc_subprocess_worker(
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 obs=job["obs"],
-                hw_features=hw_features,
+                dataset_features=dataset_features,
                 task=task,
                 robot_type=robot_type,
                 device=policy_device,
@@ -144,7 +145,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
         preprocessor: PolicyProcessorPipeline,
         postprocessor: PolicyProcessorPipeline,
         rtc_config: RTCConfig,
-        hw_features: dict,
+        dataset_features: dict,
         task: str,
         robot_type: str,
         fps: float,
@@ -154,12 +155,13 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
         shutdown_event: Event | None = None,
+        policy_obs_capture_fn: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
         self._rtc_config = rtc_config
-        self._hw_features = hw_features
+        self._dataset_features = dataset_features
         self._task = task
         self._robot_type = robot_type
         self._fps = fps
@@ -169,6 +171,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
         self._compile_warmup_inferences = compile_warmup_inferences
         self._rtc_queue_threshold = rtc_queue_threshold
         self._global_shutdown_event = shutdown_event
+        self._policy_obs_capture_fn = policy_obs_capture_fn
 
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {"obs": None}
@@ -224,7 +227,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                 policy=self._policy,
                 preprocessor=self._preprocessor,
                 postprocessor=self._postprocessor,
-                hw_features=self._hw_features,
+                dataset_features=self._dataset_features,
                 task=self._task,
                 robot_type=self._robot_type,
                 device=self._device,
@@ -325,9 +328,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                     continue
 
                 action_queue = self._action_queue
-                with self._obs_lock:
-                    obs = self._obs_holder.get("obs")
-                if action_queue is None or obs is None:
+                if action_queue is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
@@ -336,6 +337,20 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                     continue
 
                 if self._job_in_flight:
+                    time.sleep(_RTC_IDLE_SLEEP_S)
+                    continue
+
+                try:
+                    if self._policy_obs_capture_fn is not None:
+                        obs = self._policy_obs_capture_fn()
+                    else:
+                        with self._obs_lock:
+                            obs = self._obs_holder.get("obs")
+                        if obs is None:
+                            time.sleep(_RTC_IDLE_SLEEP_S)
+                            continue
+                except Exception as e:
+                    logger.warning("Failed to capture policy observation at inference boundary: %s", e)
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 

@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import abc
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from threading import Event
+from typing import Any
 
 import draccus
 
@@ -98,6 +100,7 @@ def create_inference_engine(
     use_torch_compile: bool = False,
     compile_warmup_inferences: int = 2,
     shutdown_event: Event | None = None,
+    policy_obs_capture_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> InferenceEngine:
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
@@ -118,7 +121,7 @@ def create_inference_engine(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             rtc_config=config.rtc,
-            hw_features=hw_features,
+            dataset_features=dataset_features,
             task=task,
             fps=fps,
             device=device,
@@ -126,6 +129,7 @@ def create_inference_engine(
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,
             shutdown_event=shutdown_event,
+            policy_obs_capture_fn=policy_obs_capture_fn,
         )
         if config.multiprocess:
             logger.info("Using MultiprocessRTCInferenceEngine (spawn subprocess)")
