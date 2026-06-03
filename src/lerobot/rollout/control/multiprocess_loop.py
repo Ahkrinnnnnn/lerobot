@@ -55,6 +55,22 @@ def _current_pose_action(obs_processed: dict, ordered_keys: list[str]) -> dict[s
     return {k: obs_processed[k] for k in ordered_keys if k in obs_processed}
 
 
+def _action_when_queue_empty(
+    obs_processed: dict,
+    ordered_keys: list[str],
+    last_policy_action: dict[str, float] | None,
+) -> tuple[dict[str, float], bool]:
+    """Fallback when the RTC/sync queue has no action this tick.
+
+    Prefer repeating the last policy command so the robot does not snap back to
+    measured proprio while waiting for the next chunk. Before the first policy
+    action arrives, hold the current pose.
+    """
+    if last_policy_action is not None:
+        return dict(last_policy_action), True
+    return _current_pose_action(obs_processed, ordered_keys), False
+
+
 def multiprocess_control_loop(
     ctx: RolloutContext,
     strategy: RolloutStrategy,
@@ -87,6 +103,8 @@ def multiprocess_control_loop(
     next_tick_t = time.perf_counter()
     loop_i = 0
     last_robot_action_sent: dict | None = None
+    last_policy_action_dict: dict[str, float] | None = None
+    sticky_policy_logged = False
     cached_obs_processed: dict | None = None
 
     logger.info(
@@ -147,8 +165,16 @@ def multiprocess_control_loop(
             interp = interpolator.get()
             if interp is not None and len(interp) == len(ordered_keys):
                 action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
+                last_policy_action_dict = action_dict
             else:
-                action_dict = _current_pose_action(obs_processed, ordered_keys)
+                action_dict, used_sticky = _action_when_queue_empty(
+                    obs_processed, ordered_keys, last_policy_action_dict
+                )
+                if used_sticky and not sticky_policy_logged:
+                    logger.info(
+                        "Action queue empty — repeating last policy command (avoid proprio hold snap-back)"
+                    )
+                    sticky_policy_logged = True
 
             try:
                 processed = processors.robot_action_processor((action_dict, obs_raw))
