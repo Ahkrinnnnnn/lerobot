@@ -192,6 +192,14 @@ def test_thread_safe_robot_properties():
     robot.disconnect()
 
 
+def test_compute_rtc_delay_steps_includes_obs_capture():
+    from lerobot.rollout.inference.rtc import compute_rtc_delay_steps
+
+    # 30 Hz control: 33.3ms per step; 100ms inference + 50ms obs capture => 150ms => 5 steps
+    assert compute_rtc_delay_steps(0.10, 0.05, 1.0 / 30.0) == 5
+    assert compute_rtc_delay_steps(0.0, 0.0, 1.0 / 30.0) == 0
+
+
 # ---------------------------------------------------------------------------
 # Strategy factory
 # ---------------------------------------------------------------------------

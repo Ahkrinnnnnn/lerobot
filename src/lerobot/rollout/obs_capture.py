@@ -30,7 +30,11 @@ def make_policy_obs_capture_fn(
     robot_wrapper: ThreadSafeRobot,
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
 ) -> PolicyObsCaptureFn:
-    """Return a callable that reads cameras + proprio immediately before policy inference."""
+    """Return a callable that reads cameras + proprio immediately before policy inference.
+
+    Cameras are read outside the arm I/O lock (via :class:`ThreadSafeRobot`); proprio is
+    read immediately afterward so ``observation.state`` aligns with image capture time.
+    """
 
     def capture_policy_observation() -> dict[str, Any]:
         fn = robot_wrapper.get_observation

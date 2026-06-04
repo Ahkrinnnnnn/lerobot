@@ -58,6 +58,18 @@ _RTC_MAX_CONSECUTIVE_ERRORS: int = 10
 _RTC_JOIN_TIMEOUT_S: float = 3.0
 
 
+def compute_rtc_delay_steps(
+    inference_latency_s: float,
+    obs_capture_latency_s: float,
+    time_per_chunk: float,
+) -> int:
+    """Convert combined inference + obs-capture latency to control-step delay."""
+    total_s = inference_latency_s + obs_capture_latency_s
+    if total_s <= 0 or time_per_chunk <= 0:
+        return 0
+    return math.ceil(total_s / time_per_chunk)
+
+
 # ---------------------------------------------------------------------------
 # RTC helpers
 # ---------------------------------------------------------------------------
@@ -317,6 +329,7 @@ class RTCInferenceEngine(InferenceEngine):
         """Background thread that generates action chunks via RTC."""
         try:
             latency_tracker = LatencyTracker()
+            obs_capture_tracker = LatencyTracker()
             time_per_chunk = 1.0 / self._fps
             policy_device = torch.device(self._device)
 
@@ -336,8 +349,11 @@ class RTCInferenceEngine(InferenceEngine):
 
                 if queue.qsize() <= self._rtc_queue_threshold:
                     try:
+                        obs_capture_s = 0.0
                         if self._policy_obs_capture_fn is not None:
+                            obs_capture_start = time.perf_counter()
                             obs = self._policy_obs_capture_fn()
+                            obs_capture_s = time.perf_counter() - obs_capture_start
                         else:
                             with self._obs_lock:
                                 obs = self._obs_holder.get("obs")
@@ -349,8 +365,11 @@ class RTCInferenceEngine(InferenceEngine):
                         prev_actions = queue.get_left_over()
                         prev_abs = queue.get_processed_left_over()
 
-                        latency = latency_tracker.max()
-                        delay = math.ceil(latency / time_per_chunk) if latency else 0
+                        prev_inference_s = latency_tracker.max() or 0.0
+                        prev_obs_capture_s = obs_capture_tracker.max() or 0.0
+                        delay = compute_rtc_delay_steps(
+                            prev_inference_s, prev_obs_capture_s, time_per_chunk
+                        )
 
                         original, processed, new_latency = run_rtc_inference_step(
                             policy=self._policy,
@@ -368,15 +387,19 @@ class RTCInferenceEngine(InferenceEngine):
                             relative_step=self._relative_step,
                             normalizer_step=self._normalizer_step,
                         )
-                        new_delay = math.ceil(new_latency / time_per_chunk)
+                        new_delay = compute_rtc_delay_steps(
+                            new_latency, obs_capture_s, time_per_chunk
+                        )
 
                         inference_count += 1
                         consecutive_errors = 0
                         is_warmup = self._use_torch_compile and inference_count <= warmup_required
                         if is_warmup:
                             latency_tracker.reset()
+                            obs_capture_tracker.reset()
                         else:
                             latency_tracker.add(new_latency)
+                            obs_capture_tracker.add(obs_capture_s)
 
                         queue.merge(original, processed, new_delay, idx_before)
 

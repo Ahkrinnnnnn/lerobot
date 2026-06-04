@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 from threading import Lock
 from typing import Any
 
@@ -27,7 +28,8 @@ class ThreadSafeRobot:
 
     When RTC inference runs in a background thread while the main loop
     executes actions, both threads may access the robot concurrently.
-    This wrapper serialises ``get_observation`` and ``send_action`` calls.
+    This wrapper serialises arm I/O (``send_action`` and proprio reads) while
+    allowing camera reads outside the lock — cameras use their own ``frame_lock``.
 
     Read-only properties are proxied without the lock since they don't
     mutate hardware state.
@@ -35,17 +37,50 @@ class ThreadSafeRobot:
 
     def __init__(self, robot: Robot) -> None:
         self._robot = robot
-        self._lock = Lock()
+        self._io_lock = Lock()
 
     # -- Lock-protected I/O --------------------------------------------------
 
     def get_observation(self, **kwargs: Any) -> dict[str, Any]:
-        with self._lock:
-            return self._robot.get_observation(**kwargs)
+        include_images = kwargs.get("include_images", True)
+        if include_images is False or not self._supports_proprio_only_obs():
+            with self._io_lock:
+                return self._call_get_observation(**kwargs)
+
+        if not self.cameras:
+            with self._io_lock:
+                return self._call_get_observation(include_images=False)
+
+        # Cameras outside the arm I/O lock; proprio (and gripper) under the lock.
+        images = self._read_camera_frames_unlocked()
+        with self._io_lock:
+            obs = self._call_get_observation(include_images=False)
+        obs.update(images)
+        return obs
 
     def send_action(self, action: dict[str, Any] | Any) -> Any:
-        with self._lock:
+        with self._io_lock:
             return self._robot.send_action(action)
+
+    def _supports_proprio_only_obs(self) -> bool:
+        return "include_images" in inspect.signature(self._robot.get_observation).parameters
+
+    def _call_get_observation(self, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return self._robot.get_observation(**kwargs)  # type: ignore[misc]
+        except TypeError:
+            return self._robot.get_observation()
+
+    def _read_camera_frames_unlocked(self) -> dict[str, Any]:
+        reader = getattr(self._robot, "read_observation_cameras", None)
+        if callable(reader):
+            return reader()
+
+        images: dict[str, Any] = {}
+        for cam_key, cam in self.cameras.items():
+            read_fn = getattr(cam, "read_latest", cam.read)
+            images[cam_key] = read_fn()
+        return images
 
     # -- Read-only proxies (no lock needed) -----------------------------------
 

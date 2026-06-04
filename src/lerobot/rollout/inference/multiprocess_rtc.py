@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import multiprocessing
 import queue
 import time
@@ -35,7 +34,13 @@ from lerobot.processor import PolicyProcessorPipeline
 
 from .base import InferenceEngine
 from .multiprocess_sync import _multiprocessing_context
-from .rtc import _RTC_ERROR_RETRY_DELAY_S, _RTC_IDLE_SLEEP_S, _RTC_JOIN_TIMEOUT_S, run_rtc_inference_step
+from .rtc import (
+    _RTC_ERROR_RETRY_DELAY_S,
+    _RTC_IDLE_SLEEP_S,
+    _RTC_JOIN_TIMEOUT_S,
+    compute_rtc_delay_steps,
+    run_rtc_inference_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +193,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
         self._inference_process: multiprocessing.Process | None = None
         self._job_in_flight = False
         self._consecutive_errors = 0
+        self._pending_obs_capture_s = 0.0
 
         if not self._use_torch_compile:
             self._compile_warmup_done.set()
@@ -214,6 +220,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
         self._shutdown_event.clear()
         self._job_in_flight = False
         self._consecutive_errors = 0
+        self._pending_obs_capture_s = 0.0
 
         self._mp_ctx = _multiprocessing_context()
         self._job_queue = self._mp_ctx.Queue(1)
@@ -317,11 +324,14 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
         """Dispatch inference jobs to the child and merge returned chunks."""
         try:
             latency_tracker = LatencyTracker()
+            obs_capture_tracker = LatencyTracker()
             time_per_chunk = 1.0 / self._fps
             warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 0
 
             while not self._shutdown_event.is_set():
-                self._drain_results(latency_tracker, time_per_chunk, warmup_required)
+                self._drain_results(
+                    latency_tracker, obs_capture_tracker, time_per_chunk, warmup_required
+                )
 
                 if not self._policy_active.is_set():
                     time.sleep(_RTC_IDLE_SLEEP_S)
@@ -341,8 +351,11 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                     continue
 
                 try:
+                    obs_capture_s = 0.0
                     if self._policy_obs_capture_fn is not None:
+                        obs_capture_start = time.perf_counter()
                         obs = self._policy_obs_capture_fn()
+                        obs_capture_s = time.perf_counter() - obs_capture_start
                     else:
                         with self._obs_lock:
                             obs = self._obs_holder.get("obs")
@@ -354,8 +367,11 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
-                latency = latency_tracker.max()
-                delay = math.ceil(latency / time_per_chunk) if latency else 0
+                prev_inference_s = latency_tracker.max() or 0.0
+                prev_obs_capture_s = obs_capture_tracker.max() or 0.0
+                delay = compute_rtc_delay_steps(
+                    prev_inference_s, prev_obs_capture_s, time_per_chunk
+                )
                 idx_before = action_queue.get_action_index()
                 prev_actions = action_queue.get_left_over()
                 prev_abs = action_queue.get_processed_left_over()
@@ -371,6 +387,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                 try:
                     self._job_queue.put_nowait(job)
                     self._job_in_flight = True
+                    self._pending_obs_capture_s = obs_capture_s
                 except queue.Full:
                     pass
 
@@ -387,6 +404,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
     def _drain_results(
         self,
         latency_tracker: LatencyTracker,
+        obs_capture_tracker: LatencyTracker,
         time_per_chunk: float,
         warmup_required: int,
     ) -> None:
@@ -417,14 +435,17 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
 
             self._consecutive_errors = 0
             latency_s = result["latency_s"]
-            new_delay = math.ceil(latency_s / time_per_chunk)
+            obs_capture_s = self._pending_obs_capture_s
+            new_delay = compute_rtc_delay_steps(latency_s, obs_capture_s, time_per_chunk)
             inference_count = result["inference_count"]
             is_warmup = self._use_torch_compile and inference_count <= warmup_required
 
             if is_warmup:
                 latency_tracker.reset()
+                obs_capture_tracker.reset()
             else:
                 latency_tracker.add(latency_s)
+                obs_capture_tracker.add(obs_capture_s)
 
             original = result["original"]
             processed = result["processed"]

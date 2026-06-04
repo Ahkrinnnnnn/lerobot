@@ -177,51 +177,62 @@ class CRPArm(Robot):
 
 
 
-    def get_observation(self, include_images: bool = True) -> dict[str, Any]:
+    def read_observation_cameras(self) -> dict[str, Any]:
+        """Read camera frames without touching arm proprio (safe to call outside robot I/O lock).
+
+        Synchronous ``cam.read()`` on the caller thread (same as ``lerobot_camera_stream``).
+        Background ``async_read`` + long timeouts starved under GIL when recording threads
+        compete with the camera read thread, yielding multi-second gaps between frames.
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Read arm position
+        images: dict[str, Any] = {}
+        n_retries = int(getattr(self.config, "camera_async_read_retries", 2))
+        for cam_key, cam in self.cameras.items():
+            start = time.perf_counter()
+            for attempt in range(n_retries + 1):
+                try:
+                    images[cam_key] = cam.read()
+                    break
+                except RuntimeError:
+                    if attempt >= n_retries:
+                        raise
+                    logger.warning(
+                        "%s camera %r read failed (%s/%s attempts); retrying after short delay",
+                        self,
+                        cam_key,
+                        attempt + 1,
+                        n_retries + 1,
+                    )
+                    time.sleep(0.005)
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+        return images
+
+    def _read_proprio_observation(self) -> dict[str, Any]:
+        """Read joint (and optional gripper) state from the arm controller."""
         start = time.perf_counter()
-
-        # obs_dict = self.bus.sync_read("Present_Position")
-        # obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
-
         crp_joints_dict = self.crp_arm_robot.read_joints()
-
         obs_dict = {f"{motor}.pos": val for motor, val in crp_joints_dict.items()}
-
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
-
-        if include_images:
-            # Synchronous read on the caller thread (same as lerobot_camera_stream). Background
-            # async_read + long timeouts starved under GIL when recording threads compete with the
-            # camera read thread, yielding multi-second gaps between frames.
-            n_retries = int(getattr(self.config, "camera_async_read_retries", 2))
-            for cam_key, cam in self.cameras.items():
-                start = time.perf_counter()
-                for attempt in range(n_retries + 1):
-                    try:
-                        obs_dict[cam_key] = cam.read()
-                        break
-                    except RuntimeError:
-                        if attempt >= n_retries:
-                            raise
-                        logger.warning(
-                            "%s camera %r read failed (%s/%s attempts); retrying after short delay",
-                            self,
-                            cam_key,
-                            attempt + 1,
-                            n_retries + 1,
-                        )
-                        time.sleep(0.005)
-                dt_ms = (time.perf_counter() - start) * 1e3
-                logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
         if self.config.use_gripper_feature:
             obs_dict["gripper.pos"] = float(self.get_GOT(0))
 
+        return obs_dict
+
+    def get_observation(self, include_images: bool = True) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        obs_dict: dict[str, Any] = {}
+        if include_images:
+            # Cameras first, then proprio so ``observation.state`` matches image capture time.
+            obs_dict.update(self.read_observation_cameras())
+
+        obs_dict.update(self._read_proprio_observation())
         return obs_dict
 
 
