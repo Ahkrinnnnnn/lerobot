@@ -14,5 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._sdk import ensure_crp_sdk_loaded
 from .config_crp_arm import CRPArmConfig
 from .crp_arm import CRPArm
+
+__all__ = ["CRPArm", "CRPArmConfig", "ensure_crp_sdk_loaded"]

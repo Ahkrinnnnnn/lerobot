@@ -166,6 +166,16 @@ def test_resolve_step_class_registry_name_not_found():
         DataProcessorPipeline._resolve_step_class(step_entry)
 
 
+def test_resolve_relative_actions_processor_registry_alias():
+    """HF checkpoints (e.g. lerobot/pi05_base) use the legacy registry name."""
+    from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+
+    for registry_name in ("relative_actions_processor", "delta_actions_processor"):
+        step_class, step_key = DataProcessorPipeline._resolve_step_class({"registry_name": registry_name})
+        assert step_class is RelativeActionsProcessorStep
+        assert step_key == registry_name
+
+
 def test_resolve_step_class_import_path():
     """Test resolution using full import path."""
     # Use a valid existing class (this should work)

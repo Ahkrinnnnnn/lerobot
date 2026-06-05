@@ -18,4 +18,10 @@ from .config import RobotConfig
 from .robot import Robot
 from .utils import make_robot_from_config
 
+# Register ``crp_arm`` for draccus CLI parsing. Import config only (no native SDK preload).
+try:
+    from .crp_arm.config_crp_arm import CRPArmConfig  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["Robot", "RobotConfig", "make_robot_from_config"]

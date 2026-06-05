@@ -33,7 +33,7 @@ Other teleops (non-OMY): GP command from ``ee.x`` … ``ee.yaw`` in the processe
 
 Prerequisites:
   - OMY publishes ``JointState`` and (for arm GP) ``PoseStamped`` (see ``OMYL100Config.ros_end_effector_pose_topic``).
-  - ``third_party/CrpRobotPy`` on disk; ``load_CrpRobotPy()`` configures ``sys.path`` / ``LD_LIBRARY_PATH``.
+  - ``third_party/CrpRobotPy`` on disk; the CRP arm driver loads it lazily on first robot connect.
 
 Example:
 
@@ -56,7 +56,6 @@ Note: ``--teleop.port`` is required by the config schema but unused by OMY (conn
 # TrajectoryProcessor lives in lerobot.tools.TrajProcessor (file TrajProcessor.py);
 # lerobot.tools.__init__ re-exports it — use the package import, not lerobot.tools.TrajectoryProcessor.
 from lerobot.tools import TrajectoryProcessor
-from lerobot.tools.lib_loader import load_CrpRobotPy
 
 import logging
 import math
@@ -108,10 +107,7 @@ from lerobot.teleoperators.OMY_L100.OMY_L100 import EE_STATES_TOPIC
 from lerobot.teleoperators.so_leader import SO100Leader, SO101Leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 
-# Load CRP SDK path/libraries only after ROS teleop imports. This avoids
-# CRP shared-library preloading interfering with ROS2 Python imports.
-load_CrpRobotPy()
-import lerobot.robots.crp_arm  # noqa: F401
+# Import CRPArm after ROS teleop imports; native SDK loads lazily on first robot connect.
 from lerobot.robots.crp_arm import CRPArm
 from lerobot.utils.control_utils import (
     init_keyboard_listener,

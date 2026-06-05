@@ -72,7 +72,6 @@ from lerobot.processor import (
     make_default_processors,
 )
 from lerobot.processor.rename_processor import rename_stats
-from lerobot.tools.lib_loader import load_CrpRobotPy
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -708,10 +707,6 @@ def deploy(cfg: DeployConfig) -> None:
 
 
 def main():
-    # CRP: configure ``sys.path`` / ``LD_LIBRARY_PATH`` for ``CrpRobotPy`` before any ``crp_arm`` import.
-    load_CrpRobotPy()
-    import lerobot.robots.crp_arm  # noqa: F401 — register ``crp_arm`` on ``RobotConfig``
-
     register_third_party_plugins()
     deploy()
 

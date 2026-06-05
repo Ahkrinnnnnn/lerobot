@@ -24,10 +24,7 @@ from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnected
 
 from ..robot import Robot
 from .config_crp_arm import CRPArmConfig
-
-
-# import the CrpRobotPy
-from CrpRobotPy import CrpRobotPy, RobotMode
+from ._sdk import import_crp_robot_py
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +53,8 @@ class CRPArm(Robot):
     def __init__(self, config: CRPArmConfig):
         super().__init__(config)
         self.config = config
-        
+
+        CrpRobotPy, _ = import_crp_robot_py()
         self.crp_arm_robot = CrpRobotPy()
 
         self.crp_joints = {    
@@ -122,6 +120,7 @@ class CRPArm(Robot):
 
         self.crp_arm_robot.connect(self.config.port)
         self.crp_arm_robot.servo_power_on()
+        _, RobotMode = import_crp_robot_py()
         # self.crp_arm_robot.switch_work_mode(RobotMode.Manual)
         self.crp_arm_robot.switch_work_mode(RobotMode.Auto)
 

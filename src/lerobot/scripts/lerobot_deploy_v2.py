@@ -72,7 +72,6 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1 as unitree_g1_robot,
 )
 from lerobot.rollout import DeployV2Config, build_rollout_context, create_strategy
-from lerobot.tools.lib_loader import load_CrpRobotPy
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.utils import init_logging
@@ -119,9 +118,6 @@ def deploy_v2(cfg: DeployV2Config) -> None:
 
 
 def main() -> None:
-    load_CrpRobotPy()
-    import lerobot.robots.crp_arm  # noqa: F401 — register ``crp_arm`` on ``RobotConfig``
-
     register_third_party_plugins()
     deploy_v2()
 

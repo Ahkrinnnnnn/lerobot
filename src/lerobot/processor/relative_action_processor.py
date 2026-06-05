@@ -100,6 +100,7 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
 
 
 @ProcessorStepRegistry.register("delta_actions_processor")
+@ProcessorStepRegistry.register("relative_actions_processor")  # HF checkpoint alias (e.g. lerobot/pi05_base)
 @dataclass
 class RelativeActionsProcessorStep(ProcessorStep):
     """Converts absolute actions to relative actions (action -= state) for masked dimensions.
