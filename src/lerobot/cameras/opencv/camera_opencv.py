@@ -21,6 +21,7 @@ import math
 import os
 import platform
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
@@ -47,6 +48,55 @@ from .configuration_opencv import ColorMode, OpenCVCameraConfig
 MAX_OPENCV_INDEX = 60
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_OPENCV_PROBE_TIMEOUT_S = 2.0
+
+
+def _probe_opencv_target(target: str | int) -> dict[str, Any] | None:
+    camera = cv2.VideoCapture(target)
+    try:
+        if not camera.isOpened():
+            return None
+
+        default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        default_fps = camera.get(cv2.CAP_PROP_FPS)
+        default_format = camera.get(cv2.CAP_PROP_FORMAT)
+
+        default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
+        default_fourcc_code_int = int(default_fourcc_code)
+        default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+
+        return {
+            "name": f"OpenCV Camera @ {target}",
+            "type": "OpenCV",
+            "id": target,
+            "backend_api": camera.getBackendName(),
+            "default_stream_profile": {
+                "format": default_format,
+                "fourcc": default_fourcc,
+                "width": default_width,
+                "height": default_height,
+                "fps": default_fps,
+            },
+        }
+    finally:
+        camera.release()
+
+
+def _probe_opencv_target_with_timeout(
+    target: str | int, timeout_s: float = DEFAULT_OPENCV_PROBE_TIMEOUT_S
+) -> dict[str, Any] | None:
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_probe_opencv_target, target)
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            logger.debug("OpenCV probe timed out after %.1fs for %s", timeout_s, target)
+            return None
+        except Exception:
+            logger.debug("OpenCV probe failed for %s", target, exc_info=True)
+            return None
 
 
 class OpenCVCamera(Camera):
@@ -289,12 +339,16 @@ class OpenCVCamera(Camera):
             )
 
     @staticmethod
-    def find_cameras() -> list[dict[str, Any]]:
+    def find_cameras(probe_timeout_s: float | None = DEFAULT_OPENCV_PROBE_TIMEOUT_S) -> list[dict[str, Any]]:
         """
         Detects available OpenCV cameras connected to the system.
 
         On Linux, it scans '/dev/video*' paths. On other systems (like macOS, Windows),
         it checks indices from 0 up to `MAX_OPENCV_INDEX`.
+
+        Args:
+            probe_timeout_s: Per-device timeout in seconds when opening V4L2 nodes.
+                Set to ``None`` to use blocking probes (legacy behavior).
 
         Returns:
             List[Dict[str, Any]]: A list of dictionaries,
@@ -311,34 +365,12 @@ class OpenCVCamera(Camera):
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
-            if camera.isOpened():
-                default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-                default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                default_fps = camera.get(cv2.CAP_PROP_FPS)
-                default_format = camera.get(cv2.CAP_PROP_FORMAT)
-
-                # Get FOURCC code and convert to string
-                default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
-                default_fourcc_code_int = int(default_fourcc_code)
-                default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
-
-                camera_info = {
-                    "name": f"OpenCV Camera @ {target}",
-                    "type": "OpenCV",
-                    "id": target,
-                    "backend_api": camera.getBackendName(),
-                    "default_stream_profile": {
-                        "format": default_format,
-                        "fourcc": default_fourcc,
-                        "width": default_width,
-                        "height": default_height,
-                        "fps": default_fps,
-                    },
-                }
-
+            if probe_timeout_s is None:
+                camera_info = _probe_opencv_target(target)
+            else:
+                camera_info = _probe_opencv_target_with_timeout(target, probe_timeout_s)
+            if camera_info is not None:
                 found_cameras_info.append(camera_info)
-                camera.release()
 
         return found_cameras_info
 

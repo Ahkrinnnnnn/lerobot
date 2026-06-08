@@ -29,8 +29,10 @@ ROS interfaces (ti5_interfaces):
   - Feedback: ``/multi_motor_state``, ``/joint_skillful_hand_state``
   - Commands (``send_action`` / deploy): ``/motor_command``, ``/skillfulHand_command``
 
-Cameras (``sensor_msgs/Image``, default 640x480 @ 30 FPS):
-  - ``/head/color/image_raw``, ``/left_wrist/color/image_raw``, ``/right_wrist/color/image_raw``
+Cameras (OrbbecSDK v2 via ``pyorbbecsdk2``, default 640x480 @ 30 FPS):
+  - ``head``, ``left_wrist``, ``right_wrist`` — USB Orbbec (``OrbbecCameraConfig``)
+  - Set a unique ``serial_number`` per camera when multiple devices are connected
+  - Override with ``--robot.cameras`` or use ``OrbbecCamera.find_cameras()`` to list devices
 
 ``lerobot-record-humanoid`` never calls ``send_action``; deploy / control loops use
 ``CRPHumanoid.send_action()`` to publish the same command topics.
@@ -38,7 +40,8 @@ Cameras (``sensor_msgs/Image``, default 640x480 @ 30 FPS):
 Prerequisites:
   - ROS2 stack and record/control nodes running independently.
   - ``ti5_interfaces`` available in the ROS workspace (``source install/setup.bash``).
-  - Camera publishers on the image topics (or override ``--robot.cameras``).
+  - ``pyorbbecsdk2`` for Orbbec cameras (``pip install pyorbbecsdk2`` in your conda env).
+  - Orbbec udev rules installed; assign each camera a ``serial_number`` via ``--robot.cameras``.
 
 Example:
 
@@ -75,6 +78,7 @@ from typing import Literal
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.orbbec.configuration_orbbec import OrbbecCameraConfig  # noqa: F401
 from lerobot.cameras.ros.configuration_ros import RosImageCameraConfig  # noqa: F401
 from lerobot.common.control_utils import (
     init_keyboard_listener,

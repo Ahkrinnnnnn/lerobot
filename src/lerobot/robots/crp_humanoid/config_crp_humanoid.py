@@ -23,13 +23,15 @@ from ._ti5_ros import HAND_FINGERS_PER_SIDE_DEFAULT, NUM_BODY_MOTORS_DEFAULT
 
 
 def _default_crp_humanoid_cameras() -> dict[str, CameraConfig]:
-    from lerobot.cameras.ros.configuration_ros import RosImageCameraConfig
+    from lerobot.cameras.orbbec.configuration_orbbec import OrbbecCameraConfig
 
+    # Each Orbbec needs a unique ``serial_number`` when multiple devices are connected.
+    # List devices: ``lerobot-find-cameras orbbec``. Override via ``--robot.cameras``.
     common = dict(fps=30, width=640, height=480)
     return {
-        "head": RosImageCameraConfig(image_topic="/head/color/image_raw", **common),
-        "left_wrist": RosImageCameraConfig(image_topic="/left_wrist/color/image_raw", **common),
-        "right_wrist": RosImageCameraConfig(image_topic="/right_wrist/color/image_raw", **common),
+        "head": OrbbecCameraConfig(serial_number="", **common),
+        "left_wrist": OrbbecCameraConfig(serial_number="", **common),
+        "right_wrist": OrbbecCameraConfig(serial_number="", **common),
     }
 
 

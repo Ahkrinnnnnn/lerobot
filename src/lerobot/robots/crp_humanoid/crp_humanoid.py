@@ -24,10 +24,10 @@ Commands (``send_action`` / deploy):
   - ``/motor_command`` — ``MotorCommand`` (position mode by default)
   - ``/skillfulHand_command`` — ``SkillfulHandCommand`` (L/R per message)
 
-Cameras (``sensor_msgs/Image``, default 640x480 @ 30 FPS):
-  - ``/head/color/image_raw``
-  - ``/left_wrist/color/image_raw``
-  - ``/right_wrist/color/image_raw``
+Cameras (OrbbecSDK v2 via ``pyorbbecsdk2``, default 640x480 @ 30 FPS):
+  - ``head``, ``left_wrist``, ``right_wrist`` — USB Orbbec (``OrbbecCameraConfig``)
+  - Set a unique ``serial_number`` per camera when multiple devices are connected
+  - Override with ``--robot.cameras`` or use ``OrbbecCamera.find_cameras()`` to list devices
 """
 
 from __future__ import annotations
