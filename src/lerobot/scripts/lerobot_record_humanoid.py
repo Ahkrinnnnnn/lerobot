@@ -18,39 +18,55 @@ Record a LeRobot dataset while a **humanoid is controlled by external ROS2 nodes
 This script does **not** run teleoperation or low-level control (no ``send_action``, no GP
 streaming, no trajectory processes). It only:
 
-  - polls ``crp_humanoid`` observations (joints + cameras),
-  - reads ``crp_skeleton`` ROS pass-through actions (already processed by your skeleton node),
+  - polls ``crp_humanoid`` observations (body/arm/hand joints via ti5 ROS + cameras),
+  - reads robot command topics via ``crp_skeleton`` (``MotorCommand`` + ``SkillfulHandCommand``),
   - writes episodes via ``LeRobotDataset``.
 
 For ``action_source=teleop``, ``crp_skeleton.get_action()`` is written **directly** to the
-dataset — no ``teleop_action_processor`` (the external ROS node is the processor).
+dataset — no ``teleop_action_processor`` (the external ROS stack is the processor).
+
+ROS interfaces (ti5_interfaces):
+  - Feedback: ``/multi_motor_state``, ``/joint_skillful_hand_state``
+  - Commands (``send_action`` / deploy): ``/motor_command``, ``/skillfulHand_command``
+
+Cameras (``sensor_msgs/Image``, default 640x480 @ 30 FPS):
+  - ``/head/color/image_raw``, ``/left_wrist/color/image_raw``, ``/right_wrist/color/image_raw``
+
+``lerobot-record-humanoid`` never calls ``send_action``; deploy / control loops use
+``CRPHumanoid.send_action()`` to publish the same command topics.
 
 Prerequisites:
   - ROS2 stack and record/control nodes running independently.
-  - ``crp_humanoid`` / ``crp_skeleton`` ROS subscriptions implemented (see TODOs in those modules).
+  - ``ti5_interfaces`` available in the ROS workspace (``source install/setup.bash``).
+  - Camera publishers on the image topics (or override ``--robot.cameras``).
 
 Example:
 
 ```shell
 lerobot-record-humanoid \\
     --robot.type=crp_humanoid \\
-    --robot.cameras='{head: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}' \\
     --teleop.type=crp_skeleton \\
     --teleop.port=ros \\
-    --teleop.ros_action_keys='[ee.x, ee.y, ee.z, ee.roll, ee.pitch, ee.yaw]' \\
     --dataset.repo_id=<user>/crp_humanoid_demo \\
     --dataset.num_episodes=5 \\
     --dataset.single_task="Walk forward" \\
+    --dataset.fps=30 \\
     --action_source=teleop \\
     --display_data=false
 ```
 
-Use ``--action_source=robot`` to log the humanoid's measured joints as ``action`` and omit teleop.
+Use ``--action_source=robot`` to log measured joint/hand state as ``action`` and omit teleop.
+Disable default cameras with ``--robot.cameras='{}'``.
+
+Episode timing (scheme B): ``--dataset.episode_time_s`` is the **effective** saved duration.
+``--episode_start_delay_s`` / ``--episode_end_delay_s`` add pre/post countdowns where nothing
+is written (safe with cameras and streaming encoding).
+Disable ROS feedback stub warnings with empty topics, e.g.
+``--robot.multi_motor_state_topic='' --robot.joint_skillful_hand_state_topic=''``.
 """
 
-from __future__ import annotations
-
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -59,6 +75,7 @@ from typing import Literal
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.ros.configuration_ros import RosImageCameraConfig  # noqa: F401
 from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -120,7 +137,11 @@ class HumanoidRecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
     teleop: TeleoperatorConfig | None = None
-    action_source: ActionSource = "teleop"
+    action_source: str = "teleop"
+    # Seconds before each episode to poll hardware without saving (countdown logging).
+    episode_start_delay_s: float = 2.0
+    # Seconds after each episode's effective recording window without saving (countdown logging).
+    episode_end_delay_s: float = 2.0
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None
@@ -129,11 +150,17 @@ class HumanoidRecordConfig:
     resume: bool = False
 
     def __post_init__(self) -> None:
+        if self.action_source not in ("teleop", "robot"):
+            raise ValueError(
+                f"action_source must be 'teleop' or 'robot', got {self.action_source!r}."
+            )
         if self.action_source == "teleop" and self.teleop is None:
             raise ValueError(
                 "action_source=teleop requires --teleop.type=crp_skeleton (ROS pass-through actions). "
                 "Use action_source=robot to log humanoid joint snapshots only."
             )
+        if self.episode_start_delay_s < 0 or self.episode_end_delay_s < 0:
+            raise ValueError("episode_start_delay_s and episode_end_delay_s must be >= 0.")
 
 
 @safe_stop_image_writer
@@ -145,30 +172,44 @@ def record_loop(
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | None = None,
     action_source: ActionSource = "teleop",
-    control_time_s: int | None = None,
+    control_time_s: int | float | None = None,
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
-) -> None:
+    *,
+    save_frames: bool = True,
+    countdown: bool = False,
+    phase_label: str = "",
+) -> bool:
+    """Poll robot/teleop for ``control_time_s`` seconds. Returns True if ``exit_early`` was used."""
+    if control_time_s is None or control_time_s <= 0:
+        return False
+
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
+    write_frames = dataset is not None and save_frames
     control_interval = 1 / fps
     timestamp = 0.0
     start_episode_t = time.perf_counter()
+    last_countdown_s = -1
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
             events["exit_early"] = False
-            break
+            return True
+
+        if countdown and phase_label:
+            remaining_s = control_time_s - timestamp
+            countdown_s = int(math.ceil(max(remaining_s, 0.0)))
+            if countdown_s != last_countdown_s:
+                logging.info("%s: %ds", phase_label, countdown_s)
+                last_countdown_s = countdown_s
 
         obs = robot.get_observation()
         obs_processed = robot_observation_processor(obs)
-
-        if dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         if action_source == "teleop":
             if teleop is None:
@@ -184,7 +225,8 @@ def record_loop(
         else:
             raise ValueError(f"Unknown action_source: {action_source}")
 
-        if dataset is not None:
+        if write_frames:
+            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
             action_for_frame = _values_for_dataset_action(dataset, action_values)
             action_frame = build_dataset_frame(dataset.features, action_for_frame, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
@@ -207,6 +249,86 @@ def record_loop(
             )
         precise_sleep(max(sleep_time_s, 0.0))
         timestamp = time.perf_counter() - start_episode_t
+
+    return False
+
+
+def record_episode_with_gates(
+    *,
+    robot: Robot,
+    events: dict,
+    fps: int,
+    robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
+    dataset: LeRobotDataset,
+    teleop: Teleoperator | None,
+    action_source: ActionSource,
+    episode_time_s: float,
+    episode_start_delay_s: float,
+    episode_end_delay_s: float,
+    single_task: str | None,
+    display_data: bool,
+    display_compressed_images: bool,
+    episode_index: int,
+) -> None:
+    """Run start countdown → effective recording → end countdown for one dataset episode."""
+    if episode_start_delay_s > 0:
+        logging.info(
+            "Episode %d: waiting %.1fs before saving (effective record length %.1fs).",
+            episode_index,
+            episode_start_delay_s,
+            episode_time_s,
+        )
+        record_loop(
+            robot=robot,
+            events=events,
+            fps=fps,
+            robot_observation_processor=robot_observation_processor,
+            teleop=teleop,
+            action_source=action_source,
+            dataset=dataset,
+            control_time_s=episode_start_delay_s,
+            single_task=single_task,
+            display_data=display_data,
+            display_compressed_images=display_compressed_images,
+            save_frames=False,
+            countdown=True,
+            phase_label=f"Episode {episode_index}: recording starts in",
+        )
+
+    logging.info("Episode %d: saving data for %.1fs.", episode_index, episode_time_s)
+    record_loop(
+        robot=robot,
+        events=events,
+        fps=fps,
+        robot_observation_processor=robot_observation_processor,
+        teleop=teleop,
+        action_source=action_source,
+        dataset=dataset,
+        control_time_s=episode_time_s,
+        single_task=single_task,
+        display_data=display_data,
+        display_compressed_images=display_compressed_images,
+        save_frames=True,
+    )
+
+    if episode_end_delay_s > 0:
+        logging.info("Episode %d: saving stopped; cooldown %.1fs.", episode_index, episode_end_delay_s)
+        record_loop(
+            robot=robot,
+            events=events,
+            fps=fps,
+            robot_observation_processor=robot_observation_processor,
+            teleop=teleop,
+            action_source=action_source,
+            dataset=dataset,
+            control_time_s=episode_end_delay_s,
+            single_task=single_task,
+            display_data=display_data,
+            display_compressed_images=display_compressed_images,
+            save_frames=False,
+            countdown=True,
+            phase_label=f"Episode {episode_index}: next phase in",
+        )
 
 
 @parser.wrap()
@@ -305,18 +427,21 @@ def record(cfg: HumanoidRecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                record_loop(
+                record_episode_with_gates(
                     robot=robot,
                     events=events,
                     fps=cfg.dataset.fps,
                     robot_observation_processor=robot_observation_processor,
+                    dataset=dataset,
                     teleop=teleop,
                     action_source=cfg.action_source,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
+                    episode_time_s=cfg.dataset.episode_time_s,
+                    episode_start_delay_s=cfg.episode_start_delay_s,
+                    episode_end_delay_s=cfg.episode_end_delay_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
+                    episode_index=dataset.num_episodes,
                 )
 
                 if not events["stop_recording"] and (

@@ -16,6 +16,12 @@
 
 from dataclasses import dataclass, field
 
+from lerobot.robots.crp_humanoid._ti5_ros import (
+    HAND_FINGERS_PER_SIDE_DEFAULT,
+    NUM_BODY_MOTORS_DEFAULT,
+    default_dataset_action_keys,
+)
+
 from ..config import TeleoperatorConfig
 
 
@@ -24,24 +30,29 @@ from ..config import TeleoperatorConfig
 class CRPSkeletonConfig(TeleoperatorConfig):
     """Configuration for CRP skeleton labels during passive humanoid recording.
 
-    The external ROS2 skeleton node publishes **already processed** actions (scaling,
-    frame, naming). LeRobot records ``get_action()`` verbatim — no processor pipeline.
+    Subscribes to robot **command** topics (processed exoskeleton → hardware targets) and
+    records them verbatim — no LeRobot processor pipeline.
     """
 
     # Unused for ROS-only hardware; kept for CLI compatibility.
     port: str = "ros"
 
-    # TODO(ros): Topic from the CRP skeleton processing node (message type TBD).
-    ros_action_topic: str = ""
-    # Dataset / ``get_action()`` keys exactly as published (e.g. ``ee.x``, ``j1.pos``).
-    ros_action_keys: tuple[str, ...] = ()
+    # Body + arm commands: ``ti5_interfaces/msg/MotorCommand`` (position mode, rad).
+    motor_command_topic: str = "/motor_command"
+    # Dexterous hand commands: ``ti5_interfaces/msg/SkillfulHandCommand`` (L/R on same topic).
+    skillful_hand_command_topic: str = "/skillfulHand_command"
 
-    # TODO(ros): Optional ROS node name; empty → auto ``crp_skeleton_record_<pid>``.
+    # Optional subset of dataset action keys; empty → auto ``m*.pos`` + ``hand_*.finger_*.pos``.
+    ros_action_keys: tuple[str, ...] = ()
+    ros_joint_names: tuple[str, ...] = ()
+    num_body_motors: int = NUM_BODY_MOTORS_DEFAULT
+    hand_fingers_per_side: int = HAND_FINGERS_PER_SIDE_DEFAULT
+
     ros_node_name: str = ""
-    # TODO(ros): Namespace prefix for topics (e.g. ``/skeleton``).
     ros_namespace: str = ""
 
-    # Fallback stub keys when ``ros_action_keys`` is empty (development only).
     stub_action_keys: tuple[str, ...] = field(
-        default_factory=lambda: tuple(f"j{i}.pos" for i in range(1, 7))
+        default_factory=lambda: default_dataset_action_keys(
+            NUM_BODY_MOTORS_DEFAULT, HAND_FINGERS_PER_SIDE_DEFAULT
+        )
     )
