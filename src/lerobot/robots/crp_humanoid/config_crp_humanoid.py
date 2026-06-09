@@ -66,3 +66,7 @@ class CRPHumanoidConfig(RobotConfig):
     ros_namespace: str = ""
 
     camera_async_read_retries: int = 2
+    # Max age for ``read_latest`` when polling cameras in ``get_observation``.
+    # Default: two frame periods of the slowest configured camera FPS (min 33 ms).
+    camera_read_max_age_ms: int | None = None
+    camera_parallel_read: bool = True

@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property
 from typing import Any
 
@@ -100,6 +101,7 @@ class CRPHumanoid(Robot):
 
         self._warned_stub_state = False
         self._connected = False
+        self._camera_read_pool: ThreadPoolExecutor | None = None
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -276,6 +278,11 @@ class CRPHumanoid(Robot):
         keys = hand_side_keys(side, self.config.hand_fingers_per_side)
         return {key: float(targets[i]) for i, key in enumerate(keys)}
 
+    def _release_cameras(self) -> None:
+        for cam in self.cameras.values():
+            if cam.is_connected:
+                cam.disconnect()
+
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
@@ -284,20 +291,71 @@ class CRPHumanoid(Robot):
             if self._ros.is_alive:
                 for cam in self._ros_image_cameras:
                     cam.attach_ros_node(self._ros.node)
-        for cam in self.cameras.values():
-            cam.connect()
+        try:
+            for cam in self.cameras.values():
+                cam.connect()
+        except Exception:
+            self._release_cameras()
+            raise
+        if self.cameras and self.config.camera_parallel_read:
+            self._camera_read_pool = ThreadPoolExecutor(
+                max_workers=len(self.cameras),
+                thread_name_prefix=f"{self.name}-cam-read",
+            )
         self._connected = True
         logger.info("%s connected.", self)
 
     def disconnect(self) -> None:
         if not self._connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        for cam in self.cameras.values():
-            if cam.is_connected:
-                cam.disconnect()
+        if self._camera_read_pool is not None:
+            self._camera_read_pool.shutdown(wait=True, cancel_futures=True)
+            self._camera_read_pool = None
+        self._release_cameras()
         self._shutdown_ros_node()
         self._connected = False
         logger.info("%s disconnected.", self)
+
+    def _camera_read_max_age_ms(self) -> int:
+        if self.config.camera_read_max_age_ms is not None:
+            return int(self.config.camera_read_max_age_ms)
+        fps_values = [int(cam.fps) for cam in self.cameras.values() if cam.fps]
+        target_fps = min(fps_values) if fps_values else 30
+        return max(int(2000 / target_fps), 33)
+
+    def _read_camera_latest(self, cam_key: str, cam: Any, max_age_ms: int) -> tuple[str, Any]:
+        n_retries = int(self.config.camera_async_read_retries)
+        last_error: Exception | None = None
+        for attempt in range(n_retries + 1):
+            try:
+                return cam_key, cam.read_latest(max_age_ms=max_age_ms)
+            except (TimeoutError, RuntimeError) as exc:
+                last_error = exc
+                if attempt >= n_retries:
+                    raise
+                time.sleep(0.005)
+        raise RuntimeError(f"Failed to read camera {cam_key}") from last_error
+
+    def _read_all_camera_frames(self, max_age_ms: int) -> dict[str, Any]:
+        if not self.cameras:
+            return {}
+
+        if self.config.camera_parallel_read and len(self.cameras) > 1 and self._camera_read_pool is not None:
+            frames: dict[str, Any] = {}
+            futures = [
+                self._camera_read_pool.submit(self._read_camera_latest, cam_key, cam, max_age_ms)
+                for cam_key, cam in self.cameras.items()
+            ]
+            for future in as_completed(futures):
+                cam_key, frame = future.result()
+                frames[cam_key] = frame
+            return frames
+
+        frames = {}
+        for cam_key, cam in self.cameras.items():
+            _, frame = self._read_camera_latest(cam_key, cam, max_age_ms)
+            frames[cam_key] = frame
+        return frames
 
     def get_observation(self, include_images: bool = True) -> RobotObservation:
         if not self.is_connected:
@@ -315,17 +373,9 @@ class CRPHumanoid(Robot):
                 "%s: no ROS feedback topics — joint/hand observations stay at zero.", self
             )
 
-        if include_images:
-            n_retries = int(self.config.camera_async_read_retries)
-            for cam_key, cam in self.cameras.items():
-                for attempt in range(n_retries + 1):
-                    try:
-                        obs_dict[cam_key] = cam.read()
-                        break
-                    except RuntimeError:
-                        if attempt >= n_retries:
-                            raise
-                        time.sleep(0.005)
+        if include_images and self.cameras:
+            max_age_ms = self._camera_read_max_age_ms()
+            obs_dict.update(self._read_all_camera_frames(max_age_ms))
 
         return obs_dict
 

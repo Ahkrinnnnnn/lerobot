@@ -78,11 +78,21 @@ def _select_color_profile(
     fps: int | None,
 ) -> VideoStreamProfile:
     profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+    # Prefer uncompressed / YUV over MJPG to avoid variable imdecode latency in the reader thread.
+    fmt_priority = (OBFormat.RGB, OBFormat.YUYV, OBFormat.BGR, OBFormat.MJPG)
 
     if width and height and fps:
-        for fmt in (OBFormat.RGB, OBFormat.MJPG, OBFormat.YUYV, OBFormat.BGR):
+        for fmt in fmt_priority:
             try:
-                return profiles.get_video_stream_profile(width, height, fmt, fps)
+                profile = profiles.get_video_stream_profile(width, height, fmt, fps)
+                logger.info(
+                    "Selected Orbbec color profile %dx%d@%d format=%s",
+                    width,
+                    height,
+                    fps,
+                    profile.get_format(),
+                )
+                return profile
             except OBError:
                 continue
         logger.warning(
@@ -190,13 +200,20 @@ class OrbbecCamera(Camera):
         self._start_read_thread()
 
         if warmup:
-            deadline = time.perf_counter() + max(self.warmup_s, 1.0)
+            warmup_duration_s = max(self.warmup_s, 1.0)
+            deadline = time.perf_counter() + warmup_duration_s
             while time.perf_counter() < deadline:
-                self.async_read(timeout_ms=int(self.read_timeout_ms))
+                if self.thread is not None and not self.thread.is_alive():
+                    raise ConnectionError(f"{self} read thread stopped during warmup.")
+                with self.frame_lock:
+                    if self.latest_frame is not None:
+                        break
                 time.sleep(0.05)
             with self.frame_lock:
                 if self.latest_frame is None:
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+                    raise ConnectionError(
+                        f"{self} failed to capture frames during warmup ({warmup_duration_s:.1f}s)."
+                    )
 
         logger.info("%s connected (%dx%d @ %sfps).", self, self.capture_width, self.capture_height, self.fps)
 
@@ -221,18 +238,36 @@ class OrbbecCamera(Camera):
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
             self.capture_width, self.capture_height = self.height, self.width
 
-    def _start_read_thread(self) -> None:
+    def _join_read_thread(self) -> None:
         if self.thread is not None and self.thread.is_alive():
-            return
+            join_timeout_s = max(self.read_timeout_ms / 1000.0 + 0.5, 2.0)
+            self.thread.join(timeout=join_timeout_s)
+        self.thread = None
+        self.stop_event = None
+        with self.frame_lock:
+            self.latest_frame = None
+            self.latest_timestamp = None
+        self.new_frame_event.clear()
+
+    def _stop_read_thread(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+        self._join_read_thread()
+
+    def _start_read_thread(self) -> None:
+        self._stop_read_thread()
         self.stop_event = Event()
         self.thread = Thread(target=self._read_loop, daemon=True, name=f"{self}-read")
         self.thread.start()
+        time.sleep(0.1)
 
     def _read_loop(self) -> None:
         if self.stop_event is None or self._pipeline is None:
             raise RuntimeError(f"{self}: read loop started before pipeline initialization.")
 
         while not self.stop_event.is_set():
+            if self._pipeline is None:
+                break
             try:
                 frames = self._pipeline.wait_for_frames(int(self.read_timeout_ms))
                 if frames is None:
@@ -311,20 +346,16 @@ class OrbbecCamera(Camera):
     def disconnect(self) -> None:
         if self.stop_event is not None:
             self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=2.0)
-            self.thread = None
 
-        if self._pipeline is not None:
+        pipeline = self._pipeline
+        if pipeline is not None:
             try:
-                self._pipeline.stop()
+                pipeline.stop()
             except OBError:
                 logger.exception("%s pipeline stop failed", self)
 
         self._pipeline = None
         self._device = None
         self._color_profile = None
-        with self.frame_lock:
-            self.latest_frame = None
-            self.latest_timestamp = None
+        self._join_read_thread()
         logger.info("%s disconnected.", self)
