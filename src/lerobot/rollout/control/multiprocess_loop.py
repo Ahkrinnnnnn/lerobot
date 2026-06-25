@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from lerobot.utils.constants import OBS_STR
@@ -75,6 +76,8 @@ def multiprocess_control_loop(
     ctx: RolloutContext,
     strategy: RolloutStrategy,
     control_loop_stats: dict | None = None,
+    on_step_callback: Callable[..., None] | None = None,
+    modify_action_fn: Callable[..., dict[str, float] | None] | None = None,
 ) -> None:
     """Run a fixed-rate control loop; inference runs async (RTC thread or sync subprocess).
 
@@ -105,6 +108,7 @@ def multiprocess_control_loop(
     last_robot_action_sent: dict | None = None
     last_policy_action_dict: dict[str, float] | None = None
     sticky_policy_logged = False
+    hold_pose_logged = False
     cached_obs_processed: dict | None = None
 
     logger.info(
@@ -117,7 +121,11 @@ def multiprocess_control_loop(
     )
 
     try:
-        while not shutdown.is_set():
+        while not shutdown.is_set() and not getattr(strategy, "_collect_stop", False):
+            if is_rtc and getattr(engine, "failed", False):
+                logger.error("RTC inference engine failed — stopping control loop")
+                break
+
             if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
                 logger.info("Duration limit reached (%.0fs)", cfg.duration)
                 break
@@ -129,6 +137,27 @@ def multiprocess_control_loop(
 
             if strategy._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
                 continue
+
+            intervention = getattr(strategy, "_collect_intervention", None)
+            if intervention is not None and intervention.paused:
+                if not intervention.engine_hold_paused:
+                    engine.pause()
+                    intervention.engine_hold_paused = True
+                obs_raw = _get_robot_observation(robot, include_images=False)
+                obs_processed = processors.robot_observation_processor(obs_raw)
+                hold_action = _current_pose_action(obs_processed, ordered_keys)
+                try:
+                    processed = processors.robot_action_processor((hold_action, obs_raw))
+                    robot.send_action(processed)
+                except Exception as e:
+                    logger.warning("send_action failed while operator-paused: %s", e)
+                if control_loop_stats is not None:
+                    control_loop_stats["frames"] = control_loop_stats.get("frames", 0) + 1
+                continue
+
+            if intervention is not None and intervention.engine_hold_paused:
+                engine.resume()
+                intervention.engine_hold_paused = False
 
             if is_rtc:
                 # Proprio-only every tick; policy cameras are read at the inference boundary.
@@ -150,7 +179,6 @@ def multiprocess_control_loop(
 
             if interpolator.needs_new_action():
                 if is_rtc:
-                    # RTC pops from the action queue; policy obs are captured at the inference boundary.
                     action_tensor = engine.get_action(None)
                 else:
                     obs_for_frame = cached_obs_processed if cached_obs_processed is not None else obs_processed
@@ -175,6 +203,23 @@ def multiprocess_control_loop(
                         "Action queue empty — repeating last policy command (avoid proprio hold snap-back)"
                     )
                     sticky_policy_logged = True
+                elif not used_sticky and not hold_pose_logged:
+                    logger.info(
+                        "Waiting for first policy action chunk — holding current pose until RTC inference "
+                        "returns (Pi0.5 first chunk can take 30–60s on cold start)"
+                    )
+                    hold_pose_logged = True
+
+            obs_policy_processed = cached_obs_processed
+            if modify_action_fn is not None:
+                modified = modify_action_fn(
+                    ctx=ctx,
+                    base_action_dict=action_dict,
+                    obs_processed=obs_processed,
+                    obs_policy=obs_policy_processed,
+                )
+                if modified is not None:
+                    action_dict = modified
 
             try:
                 processed = processors.robot_action_processor((action_dict, obs_raw))
@@ -190,21 +235,21 @@ def multiprocess_control_loop(
                     except Exception as retry_e:
                         logger.warning("send_action retry failed: %s", retry_e)
 
+            if on_step_callback is not None:
+                on_step_callback(
+                    obs_processed=obs_processed,
+                    obs_policy=obs_policy_processed,
+                    base_action_dict=last_policy_action_dict or action_dict,
+                    executed_action_dict=action_dict,
+                )
+
             strategy._log_telemetry(obs_processed, action_dict, ctx.runtime)
 
             dt_s = time.perf_counter() - loop_start
             if control_loop_stats is not None:
                 control_loop_stats["frames"] = control_loop_stats.get("frames", 0) + 1
                 if dt_s > control_interval:
-                    overruns = control_loop_stats.get("overruns", 0) + 1
-                    control_loop_stats["overruns"] = overruns
-                    if overruns <= 5 or overruns % 30 == 0:
-                        logger.warning(
-                            "Control loop overrun: step took %.1f ms (period %.1f ms); overruns=%d",
-                            dt_s * 1e3,
-                            control_interval * 1e3,
-                            overruns,
-                        )
+                    control_loop_stats["overruns"] = control_loop_stats.get("overruns", 0) + 1
     finally:
         engine.pause()
         logger.info("Multiprocess control loop stopped (ticks=%d)", loop_i)

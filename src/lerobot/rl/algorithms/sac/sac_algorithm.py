@@ -28,6 +28,7 @@ from torch.optim import Optimizer
 
 from lerobot.policies.gaussian_actor.modeling_gaussian_actor import (
     DISCRETE_DIMENSION_INDEX,
+    continuous_gripper_to_discrete_indices,
     MLP,
     DiscreteCritic,
     GaussianActorObservationEncoder,
@@ -61,7 +62,7 @@ class SACAlgorithm(RLAlgorithm):
         self.optimizers: dict[str, Optimizer] = {}
         self._optimization_step: int = 0
 
-        action_dim = self.policy.config.output_features[ACTION].shape[0]
+        action_dim = self.policy.config.critic_action_dim
         self._init_critics(action_dim)
         self._init_temperature(action_dim)
 
@@ -345,9 +346,10 @@ class SACAlgorithm(RLAlgorithm):
         # NOTE: We only want to keep the discrete action part
         # In the buffer we have the full action space (continuous + discrete)
         # We need to split them before concatenating them in the critic forward
-        actions_discrete: Tensor = actions[:, DISCRETE_DIMENSION_INDEX:].clone()
-        actions_discrete = torch.round(actions_discrete)
-        actions_discrete = actions_discrete.long()
+        actions_discrete = continuous_gripper_to_discrete_indices(
+            actions[:, DISCRETE_DIMENSION_INDEX:],
+            self.policy_config.num_discrete_actions,
+        )
 
         discrete_penalties: Tensor | None = None
         if complementary_info is not None:
@@ -484,14 +486,25 @@ class SACAlgorithm(RLAlgorithm):
             to their respective Adam optimizers.
         """
         actor_params = self.policy.get_optim_params()["actor"]
+        optim_cls = torch.optim.AdamW if self.config.use_adamw else torch.optim.Adam
+        optim_kwargs: dict = {"lr": self.config.actor_lr}
+        if self.config.use_adamw:
+            optim_kwargs["weight_decay"] = self.config.optimizer_weight_decay
         self.optimizers = {
-            "actor": torch.optim.Adam(actor_params, lr=self.config.actor_lr),
-            "critic": torch.optim.Adam(self.critic_ensemble.parameters(), lr=self.config.critic_lr),
-            "temperature": torch.optim.Adam([self.log_alpha], lr=self.config.temperature_lr),
+            "actor": optim_cls(actor_params, **{**optim_kwargs, "lr": self.config.actor_lr}),
+            "critic": optim_cls(
+                self.critic_ensemble.parameters(),
+                **{**optim_kwargs, "lr": self.config.critic_lr},
+            ),
+            "temperature": optim_cls(
+                [self.log_alpha],
+                **{**optim_kwargs, "lr": self.config.temperature_lr},
+            ),
         }
         if self.policy_config.num_discrete_actions is not None:
-            self.optimizers["discrete_critic"] = torch.optim.Adam(
-                self.policy.discrete_critic.parameters(), lr=self.config.critic_lr
+            self.optimizers["discrete_critic"] = optim_cls(
+                self.policy.discrete_critic.parameters(),
+                **{**optim_kwargs, "lr": self.config.critic_lr},
             )
         return self.optimizers
 

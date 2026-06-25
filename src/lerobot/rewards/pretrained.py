@@ -30,7 +30,7 @@ from safetensors.torch import load_model as load_model_as_safetensor, save_model
 from torch import Tensor, nn
 
 from lerobot.configs.rewards import RewardModelConfig
-from lerobot.utils.hub import HubMixin
+from lerobot.utils.hub import HubMixin, is_probably_local_artifact, resolve_local_model_path
 
 if TYPE_CHECKING:
     from lerobot.configs.train import TrainPipelineConfig
@@ -99,11 +99,17 @@ class PreTrainedRewardModel(nn.Module, HubMixin, abc.ABC):
                 **kwargs,
             )
         model_id = str(pretrained_name_or_path)
+        model_path = resolve_local_model_path(pretrained_name_or_path)
         instance = cls(config, **kwargs)
-        if os.path.isdir(model_id):
+        if model_path.is_dir():
             print("Loading weights from local directory")
-            model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
-            reward = cls._load_as_safetensor(instance, model_file, config.device or "cpu", strict)
+            model_file = model_path / SAFETENSORS_SINGLE_FILE
+            reward = cls._load_as_safetensor(instance, str(model_file), config.device or "cpu", strict)
+        elif is_probably_local_artifact(pretrained_name_or_path):
+            raise FileNotFoundError(
+                f"Local reward model directory not found: {model_path}. "
+                f"Expected {SAFETENSORS_SINGLE_FILE} inside that folder."
+            )
         else:
             try:
                 model_file = hf_hub_download(

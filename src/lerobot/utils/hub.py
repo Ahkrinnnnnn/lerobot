@@ -23,6 +23,27 @@ from huggingface_hub.utils import validate_hf_hub_args
 T = TypeVar("T", bound="HubMixin")
 
 
+def resolve_local_model_path(path: str | Path) -> Path:
+    """Resolve a possibly relative local checkpoint path against the current working directory."""
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = Path.cwd() / resolved
+    return resolved.resolve()
+
+
+def is_probably_local_artifact(path: str | Path) -> bool:
+    """Heuristic: distinguish local paths from HuggingFace ``namespace/repo`` ids."""
+    text = str(path).expanduser()
+    if text.startswith((".", "/", "~")):
+        return True
+    if "\\" in text:
+        return True
+    if "outputs/" in text or text.startswith("outputs"):
+        return True
+    # More than one slash → filesystem path, not ``org/model``.
+    return text.count("/") > 1
+
+
 class HubMixin:
     """
     A Mixin containing the functionality to push an object to the hub.

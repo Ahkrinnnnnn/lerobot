@@ -1,0 +1,88 @@
+{
+  "robot": {
+    "type": "crp_arm",
+    "port": "192.168.0.100",
+    "use_gripper_feature": true,
+    "cameras": {
+      "top": {
+        "type": "opencv",
+        "index_or_path": 14,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      },
+      "wrist": {
+        "type": "opencv",
+        "index_or_path": 6,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      }
+    }
+  },
+  "base_policy": {
+    "path": "outputs/models/pi05_stack_the_base_all/checkpoints/080000/pretrained_model"
+  },
+  "residual_policy": {
+    "type": "residual_gaussian",
+    "device": "cuda",
+    "vision_encoder_name": "lerobot/resnet10",
+    "freeze_vision_encoder": true,
+    "shared_encoder": true,
+    "actor_network_kwargs": {
+      "hidden_dims": [256, 256],
+      "activate_final": true,
+      "activations": "Tanh"
+    },
+    "state_encoder_hidden_dim": 256,
+    "latent_dim": 256,
+    "normalization_mapping": {
+      "VISUAL": "MEAN_STD",
+      "STATE": "MIN_MAX",
+      "ENV": "MIN_MAX",
+      "ACTION": "MIN_MAX"
+    }
+  },
+  "reward_classifier": {
+    "path": "outputs/reward_classifier/models/stack_the_base/checkpoints/003000/pretrained_model",
+    "device": "cuda",
+    "success_threshold": 0.99,
+    "success_reward": 1.0,
+    "terminate_on_success": true,
+    "manual_fallback": true
+  },
+  "dataset": {
+    "repo_id": "local/rollout_pld_stage2_stack_the_base",
+    "root": "outputs/pld_stage2_datasets/stack_the_base",
+    "single_task": "Insert the purple base in the black base",
+    "fps": 30,
+    "num_episodes": 200,
+    "video": true,
+    "push_to_hub": false,
+    "streaming_encoding": true
+  },
+  "pld": {
+    "stage1_output_dir": "outputs/pld_stage1_pi05_stack_the_base_all",
+    "n_successful_episodes": 20,
+    "probing_alpha": 0.6,
+    "max_episode_steps": 1000,
+    "episode_reset_time_s": 15,
+    "manual_scene_reset_pause_key": "space",
+    "xi": 0.05,
+    "discard_failed_episodes": true,
+    "seed": 42
+  },
+  "inference": {
+    "type": "rtc",
+    "rtc": {
+      "execution_horizon": 10
+    }
+  },
+  "fps": 30,
+  "task": "Insert the purple base in the black base",
+  "device": "cuda",
+  "interpolation_multiplier": 2,
+  "multiprocess_sync_inference": true,
+  "output_dir": "outputs/pld_stage2_datasets/stack_the_base",
+  "job_name": "pld_stage2_pi05_stack_the_base"
+}

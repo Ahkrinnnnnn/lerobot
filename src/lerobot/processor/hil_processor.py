@@ -216,13 +216,17 @@ class ImageCropResizeProcessorStep(ObservationProcessorStep):
             # NOTE (maractingi): No mps kernel for crop and resize, so we need to move to cpu
             if device.type == "mps":
                 image = image.cpu()
-            # Crop if crop params are provided for this key
+            # Crop if crop params are provided for this key and the frame is large enough.
             if self.crop_params_dict is not None and key in self.crop_params_dict:
-                crop_params = self.crop_params_dict[key]
-                image = F.crop(image, *crop_params)
+                top, left, height, width = self.crop_params_dict[key]
+                _, img_h, img_w = image.shape[-3:]
+                if top + height <= img_h and left + width <= img_w:
+                    image = F.crop(image, top, left, height, width)
             if self.resize_size is not None:
-                image = F.resize(image, self.resize_size)
-                image = image.clamp(0.0, 1.0)
+                _, img_h, img_w = image.shape[-3:]
+                if (img_h, img_w) != tuple(self.resize_size):
+                    image = F.resize(image, self.resize_size)
+                    image = image.clamp(0.0, 1.0)
             new_observation[key] = image.to(device)
 
         return new_observation
@@ -574,16 +578,20 @@ class RewardClassifierProcessorStep(ProcessorStep):
     success_reward: float = 1.0
     terminate_on_success: bool = True
 
-    reward_classifier: Any = None
+    _runtime: Any = None
 
     def __post_init__(self):
-        """Initializes the reward classifier model after the dataclass is created."""
+        """Initializes the reward classifier runtime after the dataclass is created."""
         if self.pretrained_path is not None:
-            from lerobot.rewards.classifier.modeling_classifier import Classifier
+            from lerobot.rewards.classifier.runtime import RewardClassifierRuntime
 
-            self.reward_classifier = Classifier.from_pretrained(self.pretrained_path)
-            self.reward_classifier.to(self.device)
-            self.reward_classifier.eval()
+            self._runtime = RewardClassifierRuntime.from_pretrained(
+                self.pretrained_path,
+                device=self.device,
+                success_threshold=self.success_threshold,
+                success_reward=self.success_reward,
+                terminate_on_success=self.terminate_on_success,
+            )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -598,7 +606,7 @@ class RewardClassifierProcessorStep(ProcessorStep):
         """
         new_transition = transition.copy()
         observation = new_transition.get(TransitionKey.OBSERVATION)
-        if observation is None or self.reward_classifier is None:
+        if observation is None or self._runtime is None:
             return new_transition
 
         # Extract images from observation
@@ -609,19 +617,12 @@ class RewardClassifierProcessorStep(ProcessorStep):
 
         # Run reward classifier
         start_time = time.perf_counter()
-        with torch.inference_mode():
-            success = self.reward_classifier.predict_reward(images, threshold=self.success_threshold)
-
+        reward, terminated = self._runtime.predict_reward_and_done(images)
         classifier_frequency = 1 / (time.perf_counter() - start_time)
 
-        # Calculate reward and termination
-        reward = new_transition.get(TransitionKey.REWARD, 0.0)
-        terminated = new_transition.get(TransitionKey.DONE, False)
-
-        if math.isclose(success, 1, abs_tol=1e-2):
-            reward = self.success_reward
-            if self.terminate_on_success:
-                terminated = True
+        if not math.isclose(reward, self.success_reward, abs_tol=1e-2):
+            reward = new_transition.get(TransitionKey.REWARD, 0.0)
+            terminated = new_transition.get(TransitionKey.DONE, False)
 
         # Update transition
         new_transition[TransitionKey.REWARD] = reward

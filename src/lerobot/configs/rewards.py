@@ -30,7 +30,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from lerobot.optim.optimizers import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
-from lerobot.utils.hub import HubMixin
+from lerobot.utils.hub import HubMixin, is_probably_local_artifact, resolve_local_model_path
 
 from .types import PolicyFeature
 
@@ -119,12 +119,19 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         **reward_kwargs: Any,
     ) -> T:
         model_id = str(pretrained_name_or_path)
+        model_path = resolve_local_model_path(pretrained_name_or_path)
         config_file: str | None = None
-        if Path(model_id).is_dir():
-            if CONFIG_NAME in os.listdir(model_id):
-                config_file = os.path.join(model_id, CONFIG_NAME)
+        if model_path.is_dir():
+            config_candidate = model_path / CONFIG_NAME
+            if config_candidate.is_file():
+                config_file = str(config_candidate)
             else:
-                logger.error(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
+                logger.error("%s not found in %s", CONFIG_NAME, model_path)
+        elif is_probably_local_artifact(pretrained_name_or_path):
+            raise FileNotFoundError(
+                f"Local reward model config directory not found: {model_path}. "
+                f"Expected {CONFIG_NAME} inside that folder."
+            )
         else:
             try:
                 config_file = hf_hub_download(

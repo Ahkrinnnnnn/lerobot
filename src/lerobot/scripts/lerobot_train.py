@@ -19,6 +19,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
 import time
 from contextlib import nullcontext
@@ -419,6 +420,32 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
 
+    eval_dataloader = None
+    if cfg.is_reward_model_training and cfg.eval_dataset is not None:
+        if is_main_process:
+            logging.info("Creating reward classifier evaluation dataset")
+            eval_dataset = make_dataset(cfg, dataset_cfg=cfg.eval_dataset)
+        accelerator.wait_for_everyone()
+        if not is_main_process:
+            eval_dataset = make_dataset(cfg, dataset_cfg=cfg.eval_dataset)
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            collate_fn=collate_fn,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
+        if is_main_process:
+            logging.info(
+                "Reward classifier eval set: %d frames (%d episodes)",
+                eval_dataset.num_frames,
+                eval_dataset.num_episodes,
+            )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
@@ -572,8 +599,58 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
             accelerator.wait_for_everyone()
 
+        elif cfg.is_reward_model_training and eval_dataloader is not None and is_eval_step:
+            if is_main_process:
+                from lerobot.rewards.classifier.eval import evaluate_reward_classifier
+
+                logging.info("Eval reward classifier at step %d", step)
+                eval_metrics = evaluate_reward_classifier(
+                    accelerator.unwrap_model(policy),
+                    eval_dataloader,
+                    preprocessor,
+                    device=device,
+                )
+                logging.info(
+                    "Eval accuracy: %.2f%% (%d/%d) | eval_loss: %.4f",
+                    eval_metrics.accuracy,
+                    eval_metrics.num_correct,
+                    eval_metrics.num_samples,
+                    eval_metrics.loss,
+                )
+                if wandb_logger:
+                    wandb_logger.log_dict(eval_metrics.to_dict(), step, mode="eval")
+
+            accelerator.wait_for_everyone()
+
     if is_main_process:
         progbar.close()
+
+    if cfg.is_reward_model_training and eval_dataloader is not None and is_main_process:
+        from lerobot.rewards.classifier.eval import evaluate_reward_classifier
+
+        logging.info("Final reward classifier evaluation on held-out set")
+        final_eval = evaluate_reward_classifier(
+            accelerator.unwrap_model(policy),
+            eval_dataloader,
+            preprocessor,
+            device=device,
+        )
+        logging.info(
+            "Final eval accuracy: %.2f%% (%d/%d) | eval_loss: %.4f",
+            final_eval.accuracy,
+            final_eval.num_correct,
+            final_eval.num_samples,
+            final_eval.loss,
+        )
+        eval_report_path = cfg.output_dir / "eval_accuracy.json"
+        eval_report_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_report_path.write_text(
+            json.dumps(final_eval.to_dict(), indent=2),
+            encoding="utf-8",
+        )
+        logging.info("Saved final eval metrics to %s", eval_report_path)
+        if wandb_logger:
+            wandb_logger.log_dict(final_eval.to_dict(), step, mode="eval")
 
     if eval_env:
         close_envs(eval_env)

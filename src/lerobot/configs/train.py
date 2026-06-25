@@ -76,6 +76,7 @@ def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None
 @dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
+    eval_dataset: DatasetConfig | None = None
     env: envs.EnvConfig | None = None
     policy: PreTrainedConfig | None = None
     reward_model: RewardModelConfig | None = None

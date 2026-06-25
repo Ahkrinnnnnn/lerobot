@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 import time
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,7 @@ from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import log_rerun_data
 
+from ..collect_intervention import CollectInterventionController
 from ..inference import InferenceEngine
 
 if TYPE_CHECKING:
@@ -35,6 +37,99 @@ if TYPE_CHECKING:
     from ..context import HardwareContext, ProcessorContext, RolloutContext, RuntimeContext
 
 logger = logging.getLogger(__name__)
+
+_MANUAL_RESET_BANNER = "!" * 72
+
+
+def _log_manual_scene_reset_open(
+    episode_index: int,
+    wait_s: float,
+    pause_key: str,
+    *,
+    intervention: CollectInterventionController | None,
+) -> None:
+    """Highly visible banner: inference paused — operator should reset the scene."""
+    wait_i = max(1, int(math.ceil(wait_s)))
+    logger.warning("")
+    logger.warning(_MANUAL_RESET_BANNER)
+    logger.warning(
+        "!!! [MANUAL SCENE RESET] Episode %d — INFERENCE PAUSED FOR %ds !!!",
+        episode_index,
+        wait_i,
+    )
+    logger.warning(
+        "!!! Reposition objects / fix the scene NOW (arm should be at home) !!!"
+    )
+    if pause_key and intervention is not None:
+        logger.warning(
+            "!!! Press '%s' to PAUSE / RESUME the countdown (same key as collect pause) !!!",
+            pause_key,
+        )
+    logger.warning(_MANUAL_RESET_BANNER)
+    logger.warning("")
+
+
+def _log_manual_scene_reset_countdown(episode_index: int, remaining_s: int) -> None:
+    logger.warning(
+        ">>> [MANUAL SCENE RESET] Episode %d — %ds remaining — finish scene setup <<<",
+        episode_index,
+        remaining_s,
+    )
+
+
+def _log_manual_scene_reset_close(episode_index: int) -> None:
+    logger.warning("")
+    logger.warning(_MANUAL_RESET_BANNER)
+    logger.warning(
+        "!!! [MANUAL SCENE RESET] Episode %d — TIME UP — resuming robot control !!!",
+        episode_index,
+    )
+    logger.warning(_MANUAL_RESET_BANNER)
+    logger.warning("")
+
+
+def _wait_for_manual_scene_reset_window(
+    episode_index: int,
+    wait_s: float,
+    *,
+    pause_key: str = "space",
+    collect_intervention: CollectInterventionController | None = None,
+) -> None:
+    """Count down the manual scene-reset window; reuse session pause key if provided."""
+    if collect_intervention is not None:
+        collect_intervention.clear_paused()
+    _log_manual_scene_reset_open(
+        episode_index,
+        wait_s,
+        pause_key,
+        intervention=collect_intervention,
+    )
+    deadline = time.perf_counter() + wait_s
+    last_announced = -1
+    last_pause_reminder = 0.0
+    while True:
+        if collect_intervention is not None and collect_intervention.paused:
+            now = time.perf_counter()
+            if now - last_pause_reminder >= 5.0:
+                logger.warning(
+                    ">>> [MANUAL SCENE RESET] countdown PAUSED — press '%s' to resume <<<",
+                    pause_key,
+                )
+                last_pause_reminder = now
+            precise_sleep(0.2)
+            continue
+
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        sec_left = int(math.ceil(remaining))
+        if sec_left != last_announced:
+            _log_manual_scene_reset_countdown(episode_index, sec_left)
+            last_announced = sec_left
+        precise_sleep(min(1.0, remaining))
+    if collect_intervention is not None:
+        collect_intervention.clear_paused()
+    _log_manual_scene_reset_close(episode_index)
 
 
 class RolloutStrategy(abc.ABC):
@@ -62,12 +157,12 @@ class RolloutStrategy(abc.ABC):
         """
         self._interpolator = ActionInterpolator(multiplier=ctx.runtime.cfg.interpolation_multiplier)
         self._engine = ctx.policy.inference
-        logger.info("Starting inference engine...")
+        logger.info("Debug: starting inference engine (%s)...", type(self._engine).__name__)
         self._engine.reset()
         self._engine.start()
         self._warmup_flushed = False
         self._cached_obs_processed = None
-        logger.info("Inference engine started")
+        logger.info("Debug: inference engine started (%s)", type(self._engine).__name__)
 
     def _process_observation_and_notify(self, processors: ProcessorContext, obs_raw: dict) -> dict:
         """Run the observation processor and notify the engine — throttled to policy ticks.
@@ -142,19 +237,95 @@ class RolloutStrategy(abc.ABC):
         """Smoothly interpolate the robot back to its initial position."""
         robot = hw.robot_wrapper
         target = hw.initial_position
+        gripper_key = "gripper.pos"
         try:
             current_obs = robot.get_observation()
             current_pos = {k: v for k, v in current_obs.items() if k in target}
+            if gripper_key in target:
+                open_val = float(target[gripper_key])
+                logger.info(
+                    "=== Homing === opening gripper to %.0f before moving arm (avoid carrying object home)",
+                    open_val,
+                )
+                try:
+                    robot.send_action({gripper_key: open_val})
+                    precise_sleep(0.4)
+                except Exception as e:
+                    logger.warning("Could not open gripper before homing: %s", e)
             steps = max(int(duration_s * fps), 1)
             for step in range(1, steps + 1):
                 t = step / steps
                 interp = {}
                 for k in current_pos:
+                    if k == gripper_key:
+                        continue
+                    if k not in target:
+                        continue
                     interp[k] = current_pos[k] * (1 - t) + target[k] * t
-                robot.send_action(interp)
+                if interp:
+                    robot.send_action(interp)
                 precise_sleep(1 / fps)
         except Exception as e:
             logger.warning("Could not return to initial position: %s", e)
+
+    def _wait_between_episodes(
+        self,
+        ctx: RolloutContext,
+        *,
+        episode_index: int,
+        episode_reset_time_s: float,
+        return_to_initial_duration_s: float = 3.0,
+        manual_scene_reset_pause_key: str = "space",
+        collect_intervention: CollectInterventionController | None = None,
+    ) -> None:
+        """Pause inference, home the arm, then wait for manual scene reset.
+
+        ``episode_reset_time_s`` is the full manual-reset window **after homing**
+        (homing time is extra, not subtracted from the countdown).
+        """
+        return_home = (
+            ctx.runtime.cfg.return_to_initial_position and bool(ctx.hardware.initial_position)
+        )
+
+        logger.info(
+            "=== Episode %d RESET START === pausing inference%s",
+            episode_index,
+            " — homing arm to initial position" if return_home else "",
+        )
+
+        if self._engine is not None:
+            self._engine.pause()
+
+        reset_start = time.perf_counter()
+        if return_home:
+            logger.info("=== Episode %d RESET === moving arm to initial position...", episode_index)
+            self._return_to_initial_position(
+                ctx.hardware, duration_s=return_to_initial_duration_s
+            )
+        else:
+            logger.info(
+                "=== Episode %d RESET === skipping homing (return_to_initial_position=false or no initial pose)",
+                episode_index,
+            )
+
+        homing_s = time.perf_counter() - reset_start
+        if episode_reset_time_s > 0:
+            logger.info(
+                "=== Episode %d RESET === homing took %.1fs — starting %.0fs manual scene window",
+                episode_index,
+                homing_s,
+                episode_reset_time_s,
+            )
+            _wait_for_manual_scene_reset_window(
+                episode_index,
+                episode_reset_time_s,
+                pause_key=manual_scene_reset_pause_key,
+                collect_intervention=collect_intervention,
+            )
+
+        if self._engine is not None:
+            self._engine.resume()
+        logger.info("=== Episode %d RESET COMPLETE === resuming collection", episode_index)
 
     @staticmethod
     def _log_telemetry(

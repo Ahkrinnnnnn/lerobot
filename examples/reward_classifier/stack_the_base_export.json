@@ -1,0 +1,31 @@
+{
+  "mode": "build",
+  "label_source": "annotations",
+  "source": {
+    "repo_id": "local/stack_the_base_all",
+    "root": "/media/dingyuxuan/My Passport/stack_the_base_all"
+  },
+  "output": {
+    "annotation_path": "outputs/reward_classifier/annotations/stack_the_base.json",
+    "dataset_repo_id": "local/stack_the_base_reward_classifier",
+    "dataset_root": "outputs/reward_classifier/datasets/stack_the_base_labeled",
+    "eval_dataset_repo_id": "local/stack_the_base_reward_classifier_eval",
+    "eval_dataset_root": "outputs/reward_classifier/datasets/stack_the_base_labeled_eval",
+    "eval_split_ratio": 0.2,
+    "overwrite": true
+  },
+  "camera_keys": [
+    "observation.images.top",
+    "observation.images.wrist"
+  ],
+  "image_preprocessing": {
+    "crop_params_dict": {
+      "observation.images.top": [0, 90, 240, 480]
+    },
+    "resize_size": [128, 128]
+  },
+  "use_videos": false,
+  "max_frames_per_segment": 30,
+  "class_ratio": [1, 5],
+  "seed": 42
+}

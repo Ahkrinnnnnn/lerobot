@@ -32,6 +32,38 @@ from .configuration_gaussian_actor import GaussianActorConfig, is_image_feature
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
 
+def continuous_gripper_to_discrete_indices(
+    gripper_values: Tensor,
+    num_discrete_actions: int,
+    *,
+    threshold: float | None = None,
+) -> Tensor:
+    """Map gripper commands to discrete class indices for the DQN-style discrete critic.
+
+    Buffer actions may store either integer class labels (0/1) or hardware continuous
+    commands (e.g. CRP GOT0 in [0, 1000]). ``torch.gather`` requires indices in
+    ``[0, num_discrete_actions)``.
+    """
+    values = gripper_values
+    if values.ndim > 1 and values.shape[-1] == 1:
+        values = values.squeeze(-1)
+
+    rounded = torch.round(values)
+    already_discrete = (
+        values.min() >= 0
+        and values.max() < num_discrete_actions
+        and torch.max(torch.abs(values - rounded)) < 1e-4
+    )
+    if already_discrete:
+        indices = rounded.long()
+    else:
+        if threshold is None:
+            threshold = 0.5 if float(values.max()) <= 1.0 + 1e-6 else 500.0
+        indices = (values >= threshold).long()
+
+    return indices.clamp(0, num_discrete_actions - 1).unsqueeze(-1)
+
+
 class GaussianActorPolicy(
     PreTrainedPolicy,
 ):

@@ -1,0 +1,12 @@
+{
+  "mode": "annotate",
+  "source": {
+    "repo_id": "local/stack_the_base_all",
+    "root": "/media/dingyuxuan/My Passport/stack_the_base_all"
+  },
+  "output": {
+    "annotation_path": "outputs/reward_classifier/annotations/stack_the_base.json"
+  },
+  "episode_start": 0,
+  "playback_fps": 15
+}

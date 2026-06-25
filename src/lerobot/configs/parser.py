@@ -307,10 +307,13 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                     # Also extract path fields from the YAML/JSON config file
                     if config_path_cli:
                         config_path_cli = extract_path_fields_from_config(config_path_cli, path_fields)
+                        # Point draccus at the cleaned config (path-only nested fields removed).
+                        cli_args = filter_arg("config_path", cli_args)
                 if has_method(argtype, "from_pretrained") and config_path_cli:
-                    cli_args = filter_arg("config_path", cli_args)
                     cfg = argtype.from_pretrained(config_path_cli, cli_args=cli_args)
                 else:
+                    if config_path_cli:
+                        cli_args.append(f"--config_path={config_path_cli}")
                     cfg = draccus.parse(config_class=argtype, config_path=config_path, args=cli_args)
             response = fn(cfg, *args, **kwargs)
             return response

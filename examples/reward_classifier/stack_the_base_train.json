@@ -1,0 +1,54 @@
+{
+  "dataset": {
+    "repo_id": "local/stack_the_base_reward_classifier",
+    "root": "outputs/reward_classifier/datasets/stack_the_base_labeled"
+  },
+  "eval_dataset": {
+    "repo_id": "local/stack_the_base_reward_classifier_eval",
+    "root": "outputs/reward_classifier/datasets/stack_the_base_labeled_eval"
+  },
+  "reward_model": {
+    "type": "reward_classifier",
+    "model_name": "lerobot/resnet10",
+    "model_type": "cnn",
+    "num_cameras": 2,
+    "num_classes": 2,
+    "hidden_dim": 256,
+    "dropout_rate": 0.1,
+    "learning_rate": 0.0001,
+    "device": "cuda",
+    "image_preprocessing": {
+      "crop_params_dict": {
+        "observation.images.top": [0, 90, 240, 480]
+      },
+      "resize_size": [128, 128]
+    },
+    "input_features": {
+      "observation.images.top": {
+        "type": "VISUAL",
+        "shape": [3, 128, 128]
+      },
+      "observation.images.wrist": {
+        "type": "VISUAL",
+        "shape": [3, 128, 128]
+      }
+    },
+    "output_features": {
+      "next.reward": {
+        "type": "REWARD",
+        "shape": [1]
+      }
+    }
+  },
+  "batch_size": 32,
+  "num_workers": 4,
+  "steps": 3000,
+  "log_freq": 50,
+  "eval_freq": 500,
+  "save_freq": 1000,
+  "save_checkpoint": true,
+  "seed": 42,
+  "resume": false,
+  "output_dir": "outputs/reward_classifier/models/stack_the_base",
+  "job_name": "reward_classifier_stack_the_base"
+}

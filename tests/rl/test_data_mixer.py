@@ -78,6 +78,34 @@ def test_online_offline_mixer_sample():
     assert batch["reward"].shape[0] == 10
 
 
+def test_online_offline_mixer_synthesizes_base_action():
+    """Mixer tolerates legacy offline buffers without complementary_info."""
+    online = ReplayBuffer(capacity=10, device="cpu", state_keys=[OBS_STATE], use_drq=False)
+    offline = ReplayBuffer(capacity=10, device="cpu", state_keys=[OBS_STATE], use_drq=False)
+    for _ in range(5):
+        online.add(
+            state={OBS_STATE: torch.randn(1, 4)},
+            action=torch.randn(1, 2),
+            reward=1.0,
+            next_state={OBS_STATE: torch.randn(1, 4)},
+            done=False,
+            truncated=False,
+        )
+        offline.add(
+            state={OBS_STATE: torch.randn(1, 4)},
+            action=torch.randn(1, 2),
+            reward=1.0,
+            next_state={OBS_STATE: torch.randn(1, 4)},
+            done=False,
+            truncated=False,
+        )
+    mixer = OnlineOfflineMixer(online_buffer=online, offline_buffer=offline, online_ratio=0.5)
+    batch = mixer.sample(batch_size=4)
+    assert batch["complementary_info"] is not None
+    assert "base_action" in batch["complementary_info"]
+    assert batch["complementary_info"]["base_action"].shape[0] == 4
+
+
 def test_online_offline_mixer_iterator():
     """get_iterator yields batches of the requested size."""
     buf = _make_buffer(capacity=50)

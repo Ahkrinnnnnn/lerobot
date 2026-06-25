@@ -82,6 +82,9 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     policy_update_freq: int = 1
     # Gradient clipping norm for the SAC algorithm
     grad_clip_norm: float = 40.0
+    # Use AdamW instead of Adam (PLD paper Table 5)
+    use_adamw: bool = False
+    optimizer_weight_decay: float = 0.01
 
     # Optimizations
     # torch.compile is currently disabled by default

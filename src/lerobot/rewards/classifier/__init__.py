@@ -12,8 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_classifier import RewardClassifierConfig
-from .modeling_classifier import Classifier
-from .processor_classifier import make_classifier_processor
+"""Binary reward classifier: model, data prep, training helpers, and deployment."""
 
-__all__ = ["RewardClassifierConfig", "Classifier", "make_classifier_processor"]
+from .annotations import EpisodeRewardAnnotation, RewardClassifierAnnotations
+from .configuration_classifier import RewardClassifierConfig
+from .detector import RewardClassifierDetector
+from .dataset import inspect_reward_classifier_dataset
+from .eval import RewardClassifierEvalMetrics, evaluate_reward_classifier
+from .modeling_classifier import Classifier
+from .pipeline_config import RewardClassifierPipelineConfig, RewardClassifierRuntimeConfig
+from .processor_classifier import make_classifier_processor
+from .runtime import RewardClassifierRuntime, build_reward_classifier_batch
+
+__all__ = [
+    # Model + train
+    "RewardClassifierConfig",
+    "Classifier",
+    "make_classifier_processor",
+    "RewardClassifierRuntime",
+    "build_reward_classifier_batch",
+    "RewardClassifierEvalMetrics",
+    "evaluate_reward_classifier",
+    # Data prep CLI
+    "EpisodeRewardAnnotation",
+    "RewardClassifierAnnotations",
+    "RewardClassifierPipelineConfig",
+    "inspect_reward_classifier_dataset",
+    # Deploy
+    "RewardClassifierRuntimeConfig",
+    "RewardClassifierDetector",
+]

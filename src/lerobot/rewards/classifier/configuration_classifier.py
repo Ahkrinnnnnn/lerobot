@@ -19,6 +19,14 @@ from lerobot.optim import AdamWConfig, LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import OBS_IMAGE
 
 
+@dataclass
+class RewardClassifierImagePreprocessingConfig:
+    """Optional crop/resize for reward-classifier images (export and/or train-time)."""
+
+    crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
+    resize_size: tuple[int, int] | None = None
+
+
 @RewardModelConfig.register_subclass(name="reward_classifier")
 @dataclass
 class RewardClassifierConfig(RewardModelConfig):
@@ -37,11 +45,20 @@ class RewardClassifierConfig(RewardModelConfig):
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
+    image_preprocessing: RewardClassifierImagePreprocessingConfig | None = None
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
         }
     )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.image_preprocessing is not None and self.image_preprocessing.resize_size is not None:
+            resize_size = self.image_preprocessing.resize_size
+            for key, feat in self.input_features.items():
+                if key.startswith(OBS_IMAGE) and len(feat.shape) == 3:
+                    feat.shape = (feat.shape[0], *resize_size)
 
     @property
     def observation_delta_indices(self) -> list | None:
@@ -67,8 +84,13 @@ class RewardClassifierConfig(RewardModelConfig):
 
     def validate_features(self) -> None:
         """Validate feature configurations."""
-        has_image = any(key.startswith(OBS_IMAGE) for key in self.input_features)
-        if not has_image:
+        image_keys = [key for key in self.input_features if key.startswith(OBS_IMAGE)]
+        if not image_keys:
             raise ValueError(
                 "You must provide an image observation (key starting with 'observation.image') in the input features"
+            )
+        if self.num_cameras != len(image_keys):
+            raise ValueError(
+                f"num_cameras={self.num_cameras} but input_features defines {len(image_keys)} image keys: "
+                f"{image_keys}"
             )

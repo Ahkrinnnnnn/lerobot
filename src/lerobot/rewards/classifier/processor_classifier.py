@@ -25,6 +25,7 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
+from lerobot.processor.hil_processor import ImageCropResizeProcessorStep
 
 from .configuration_classifier import RewardClassifierConfig
 
@@ -40,8 +41,9 @@ def make_classifier_processor(
     Constructs pre-processor and post-processor pipelines for the reward classifier.
 
     The pre-processing pipeline prepares input data for the classifier by:
-    1. Normalizing both input and output features based on dataset statistics.
-    2. Moving the data to the specified device.
+    1. Optional crop/resize when images are still full-resolution (skipped if dataset is already 128×128).
+    2. Normalizing both input and output features based on dataset statistics.
+    3. Moving the data to the specified device.
 
     The post-processing pipeline handles the classifier's output by:
     1. Moving the data to the CPU.
@@ -55,15 +57,28 @@ def make_classifier_processor(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
-    input_steps = [
-        NormalizerProcessorStep(
-            features=config.input_features, norm_map=config.normalization_mapping, stats=dataset_stats
-        ),
-        NormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
-        ),
-        DeviceProcessorStep(device=config.device),
-    ]
+    input_steps = []
+    if config.image_preprocessing is not None:
+        prep = config.image_preprocessing
+        if prep.crop_params_dict or prep.resize_size is not None:
+            input_steps.append(
+                ImageCropResizeProcessorStep(
+                    crop_params_dict=prep.crop_params_dict,
+                    resize_size=prep.resize_size,
+                )
+            )
+
+    input_steps.extend(
+        [
+            NormalizerProcessorStep(
+                features=config.input_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            ),
+            NormalizerProcessorStep(
+                features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            ),
+            DeviceProcessorStep(device=config.device),
+        ]
+    )
     output_steps = [DeviceProcessorStep(device="cpu"), IdentityProcessorStep()]
 
     return (

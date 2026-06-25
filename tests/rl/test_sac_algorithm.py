@@ -268,6 +268,21 @@ def test_update_with_discrete_critic():
     assert "discrete_critic" in stats.grad_norms
 
 
+def test_discrete_critic_accepts_crp_gripper_continuous_values():
+    """CRP stores gripper.pos as GOT0 in [0, 1000], not class indices 0/1."""
+    from lerobot.policies.gaussian_actor.modeling_gaussian_actor import continuous_gripper_to_discrete_indices
+
+    gripper = torch.tensor([[0.0], [1000.0], [250.0], [750.0]])
+    indices = continuous_gripper_to_discrete_indices(gripper, num_discrete_actions=2)
+    assert indices.tolist() == [[0], [1], [0], [1]]
+
+    algorithm, _ = _make_algorithm(num_discrete_actions=2, action_dim=6)
+    batch = _make_batch(action_dim=7, batch_size=4)
+    batch[ACTION][:, -1] = torch.tensor([0.0, 1000.0, 500.0, 999.0])
+    stats = algorithm.update(iter([batch]))
+    assert "loss_discrete_critic" in stats.losses
+
+
 # ===========================================================================
 # update with UTD ratio > 1
 # ===========================================================================

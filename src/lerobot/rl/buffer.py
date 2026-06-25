@@ -502,6 +502,396 @@ class ReplayBuffer:
 
         return replay_buffer
 
+    @classmethod
+    def from_successful_episodes(
+        cls,
+        lerobot_dataset: LeRobotDataset,
+        device: str = "cuda:0",
+        state_keys: Sequence[str] | None = None,
+        capacity: int | None = None,
+        success_reward_threshold: float = 0.5,
+        **kwargs,
+    ) -> "ReplayBuffer":
+        """Convert only successful episodes from a LeRobotDataset into a ReplayBuffer."""
+        if state_keys is None:
+            raise ValueError("state_keys must be provided.")
+
+        transitions = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
+        successful: list = []
+        episode_reward = 0.0
+        episode_transitions: list = []
+
+        for tr in transitions:
+            episode_transitions.append(tr)
+            episode_reward = max(episode_reward, float(tr["reward"].item() if hasattr(tr["reward"], "item") else tr["reward"]))
+            done = bool(tr["done"].item() if hasattr(tr["done"], "item") else tr["done"])
+            if done:
+                if episode_reward >= success_reward_threshold:
+                    successful.extend(episode_transitions)
+                episode_transitions = []
+                episode_reward = 0.0
+
+        if capacity is None:
+            capacity = max(len(successful), 1)
+
+        buffer = cls(capacity=capacity, device=device, state_keys=state_keys, **kwargs)
+        for tr in successful:
+            buffer.add(
+                state=tr["state"],
+                action=tr[ACTION],
+                reward=float(tr["reward"].item() if hasattr(tr["reward"], "item") else tr["reward"]),
+                next_state=tr["next_state"],
+                done=bool(tr["done"].item() if hasattr(tr["done"], "item") else tr["done"]),
+                truncated=bool(
+                    tr.get("truncated", False).item()
+                    if hasattr(tr.get("truncated", False), "item")
+                    else tr.get("truncated", False)
+                ),
+                complementary_info=tr.get("complementary_info"),
+            )
+        return buffer
+
+    def chronological_buffer_indices(self) -> list[int]:
+        """Buffer slot indices in chronological insertion order."""
+        if self.size == 0:
+            return []
+        return [(self.position - self.size + idx) % self.capacity for idx in range(self.size)]
+
+    def episode_buffer_index_ranges(self) -> list[tuple[int, int]]:
+        """Inclusive (start, end) buffer indices for each stored episode."""
+        indices = self.chronological_buffer_indices()
+        if not indices:
+            return []
+
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        for i, buf_idx in enumerate(indices):
+            if bool(self.dones[buf_idx]) or bool(self.truncateds[buf_idx]):
+                ranges.append((indices[start], indices[i]))
+                start = i + 1
+        if start < len(indices):
+            ranges.append((indices[start], indices[-1]))
+        return ranges
+
+    def summarize_episodes(self) -> list[dict]:
+        """Summarize each episode stored in the buffer (0-based episode index)."""
+        summaries: list[dict] = []
+        for episode_index, (start_idx, end_idx) in enumerate(self.episode_buffer_index_ranges()):
+            indices = self.chronological_buffer_indices()
+            start_pos = indices.index(start_idx)
+            end_pos = indices.index(end_idx)
+            chunk = indices[start_pos : end_pos + 1]
+            rewards = [float(self.rewards[i].item()) for i in chunk]
+            summaries.append(
+                {
+                    "episode_index": episode_index,
+                    "length": len(chunk),
+                    "max_reward": max(rewards) if rewards else 0.0,
+                    "final_reward": rewards[-1] if rewards else 0.0,
+                    "done": bool(self.dones[end_idx]) or bool(self.truncateds[end_idx]),
+                }
+            )
+        return summaries
+
+    def _transition_at(self, buf_idx: int) -> dict:
+        state = {k: self.states[k][buf_idx].unsqueeze(0) for k in self.states}
+        if self.optimize_memory:
+            next_buf_idx = (buf_idx + 1) % self.capacity
+            next_state = {k: self.states[k][next_buf_idx].unsqueeze(0) for k in self.states}
+        else:
+            next_state = {k: self.next_states[k][buf_idx].unsqueeze(0) for k in self.next_states}
+
+        complementary_info = None
+        if self.has_complementary_info:
+            complementary_info = {}
+            for key in self.complementary_info_keys:
+                val = self.complementary_info[key][buf_idx]
+                if isinstance(val, torch.Tensor):
+                    complementary_info[key] = val.unsqueeze(0)
+                else:
+                    complementary_info[key] = val
+
+        return {
+            "state": state,
+            ACTION: self.actions[buf_idx].unsqueeze(0),
+            "reward": float(self.rewards[buf_idx].item()),
+            "next_state": next_state,
+            "done": bool(self.dones[buf_idx].item()),
+            "truncated": bool(self.truncateds[buf_idx].item()),
+            "complementary_info": complementary_info,
+        }
+
+    def filter_episodes(
+        self,
+        exclude_episode_indices: set[int] | None = None,
+        include_episode_indices: set[int] | None = None,
+    ) -> "ReplayBuffer":
+        """Return a new buffer containing only the selected episodes."""
+        if exclude_episode_indices is not None and include_episode_indices is not None:
+            raise ValueError("Specify either exclude_episode_indices or include_episode_indices, not both.")
+
+        ranges = self.episode_buffer_index_ranges()
+        if not ranges:
+            raise ValueError("Replay buffer is empty.")
+
+        kept_ranges: list[tuple[int, int]] = []
+        for episode_index, buf_range in enumerate(ranges):
+            if exclude_episode_indices is not None and episode_index in exclude_episode_indices:
+                continue
+            if include_episode_indices is not None and episode_index not in include_episode_indices:
+                continue
+            kept_ranges.append(buf_range)
+
+        if not kept_ranges:
+            raise ValueError("No episodes left after filtering.")
+
+        kept_count = sum(
+            self.chronological_buffer_indices().index(end) - self.chronological_buffer_indices().index(start) + 1
+            for start, end in kept_ranges
+        )
+        new_buffer = ReplayBuffer(
+            capacity=max(kept_count, 1),
+            device=self.device,
+            state_keys=self.state_keys,
+            image_augmentation_function=self.image_augmentation_function,
+            use_drq=self.use_drq,
+            storage_device=self.storage_device,
+            optimize_memory=self.optimize_memory,
+        )
+
+        chronological = self.chronological_buffer_indices()
+        for start_idx, end_idx in kept_ranges:
+            start_pos = chronological.index(start_idx)
+            end_pos = chronological.index(end_idx)
+            for buf_idx in chronological[start_pos : end_pos + 1]:
+                tr = self._transition_at(buf_idx)
+                new_buffer.add(
+                    state=tr["state"],
+                    action=tr[ACTION],
+                    reward=tr["reward"],
+                    next_state=tr["next_state"],
+                    done=tr["done"],
+                    truncated=tr["truncated"],
+                    complementary_info=tr.get("complementary_info"),
+                )
+        return new_buffer
+
+    def compact(
+        self,
+        capacity: int | None = None,
+        optimize_memory: bool | None = None,
+    ) -> "ReplayBuffer":
+        """Return a new buffer that only allocates for stored transitions.
+
+        Use this to drop unused pre-allocated slots after offline collection.
+        ``optimize_memory`` here controls whether ``next_state`` is duplicated in RAM,
+        not whether empty capacity slots are freed.
+        """
+        if self.size == 0:
+            raise ValueError("Cannot compact an empty buffer.")
+
+        new_capacity = self.size if capacity is None else capacity
+        if new_capacity < self.size:
+            raise ValueError(
+                f"Requested capacity {new_capacity} is smaller than stored transitions ({self.size})."
+            )
+
+        new_buffer = ReplayBuffer(
+            capacity=new_capacity,
+            device=self.device,
+            state_keys=self.state_keys,
+            image_augmentation_function=self.image_augmentation_function,
+            use_drq=self.use_drq,
+            storage_device=self.storage_device,
+            optimize_memory=self.optimize_memory if optimize_memory is None else optimize_memory,
+        )
+
+        for buf_idx in self.chronological_buffer_indices():
+            tr = self._transition_at(buf_idx)
+            new_buffer.add(
+                state=tr["state"],
+                action=tr[ACTION],
+                reward=tr["reward"],
+                next_state=tr["next_state"],
+                done=tr["done"],
+                truncated=tr["truncated"],
+                complementary_info=tr.get("complementary_info"),
+            )
+        return new_buffer
+
+    def ensure_base_action_complementary_info(self) -> "ReplayBuffer":
+        """Backfill ``base_action`` for legacy buffers collected without complementary_info.
+
+        Offline PLD trajectories used frozen base only, so stored ``action`` equals base action.
+        """
+        if self.size == 0:
+            return self
+        if self.has_complementary_info and "base_action" in self.complementary_info_keys:
+            return self
+
+        import logging
+
+        from lerobot.utils.constants import ACTION
+
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "Replay buffer missing complementary_info['base_action']; "
+            "backfilling from stored actions (%d transitions).",
+            self.size,
+        )
+
+        chronological = self.chronological_buffer_indices()
+        new_buffer = ReplayBuffer(
+            capacity=self.capacity,
+            device=self.device,
+            state_keys=self.state_keys,
+            image_augmentation_function=self.image_augmentation_function,
+            use_drq=self.use_drq,
+            storage_device=self.storage_device,
+            optimize_memory=self.optimize_memory,
+        )
+
+        for pos, buf_idx in enumerate(chronological):
+            tr = self._transition_at(buf_idx)
+            action = tr[ACTION]
+            comp: dict[str, torch.Tensor] = {"base_action": action.clone()}
+            if pos + 1 < len(chronological):
+                next_tr = self._transition_at(chronological[pos + 1])
+                comp["next_base_action"] = next_tr[ACTION].clone()
+            new_buffer.add(
+                state=tr["state"],
+                action=action,
+                reward=tr["reward"],
+                next_state=tr["next_state"],
+                done=tr["done"],
+                truncated=tr["truncated"],
+                complementary_info=comp,
+            )
+        return new_buffer
+
+    def _chronological_index_tensor(self) -> torch.Tensor:
+        indices = self.chronological_buffer_indices()
+        return torch.tensor(indices, dtype=torch.long, device=self.storage_device)
+
+    def _restore_compact_payload(self, payload: dict) -> None:
+        """Expand a compact on-disk payload into the pre-allocated ring buffer."""
+        saved_size = payload["size"]
+        device = self.storage_device
+
+        self.states = {
+            key: torch.empty((self.capacity, *tensor.shape[1:]), device=device)
+            for key, tensor in payload["states"].items()
+        }
+        idx = torch.arange(saved_size, device=device)
+        for key, tensor in payload["states"].items():
+            self.states[key].index_copy_(0, idx, tensor.to(device))
+
+        self.actions = torch.empty((self.capacity, *payload["actions"].shape[1:]), device=device)
+        self.actions.index_copy_(0, idx, payload["actions"].to(device))
+        self.rewards = torch.empty((self.capacity,), device=device)
+        self.rewards.index_copy_(0, idx, payload["rewards"].to(device))
+        self.dones = torch.empty((self.capacity,), dtype=torch.bool, device=device)
+        self.dones.index_copy_(0, idx, payload["dones"].to(device))
+        self.truncateds = torch.empty((self.capacity,), dtype=torch.bool, device=device)
+        self.truncateds.index_copy_(0, idx, payload["truncateds"].to(device))
+
+        if not self.optimize_memory:
+            self.next_states = {
+                key: torch.empty((self.capacity, *tensor.shape[1:]), device=device)
+                for key, tensor in payload["next_states"].items()
+            }
+            for key, tensor in payload["next_states"].items():
+                self.next_states[key].index_copy_(0, idx, tensor.to(device))
+        else:
+            self.next_states = self.states
+
+        self.has_complementary_info = payload.get("has_complementary_info", False)
+        self.complementary_info_keys = payload.get("complementary_info_keys", [])
+        self.complementary_info = {}
+        if self.has_complementary_info:
+            for key, tensor in payload["complementary_info"].items():
+                self.complementary_info[key] = torch.empty(
+                    (self.capacity, *tensor.shape[1:]), device=device
+                )
+                self.complementary_info[key].index_copy_(0, idx, tensor.to(device))
+
+        self.size = saved_size
+        self.position = saved_size % self.capacity
+        self.initialized = True
+
+    def save(self, path: str) -> None:
+        """Persist buffer contents to disk."""
+        from pathlib import Path
+
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "capacity": self.capacity,
+            "device": self.device,
+            "storage_device": self.storage_device,
+            "state_keys": self.state_keys,
+            "optimize_memory": self.optimize_memory,
+            "use_drq": self.use_drq,
+            "position": self.position,
+            "size": self.size,
+            "initialized": self.initialized,
+            "has_complementary_info": self.has_complementary_info,
+            "complementary_info_keys": self.complementary_info_keys,
+            "compact": True,
+        }
+        if self.initialized:
+            idx = self._chronological_index_tensor().cpu()
+            payload["states"] = {k: self.states[k][idx].cpu() for k in self.states}
+            payload["actions"] = self.actions[idx].cpu()
+            payload["rewards"] = self.rewards[idx].cpu()
+            payload["dones"] = self.dones[idx].cpu()
+            payload["truncateds"] = self.truncateds[idx].cpu()
+            if not self.optimize_memory:
+                payload["next_states"] = {k: self.next_states[k][idx].cpu() for k in self.next_states}
+            if self.has_complementary_info:
+                payload["complementary_info"] = {
+                    k: self.complementary_info[k][idx].cpu() for k in self.complementary_info_keys
+                }
+        torch.save(payload, path_obj)
+
+    @classmethod
+    def load(cls, path: str, device: str | None = None) -> "ReplayBuffer":
+        """Restore a buffer previously saved with :meth:`save`."""
+        payload = torch.load(path, weights_only=False)
+        buffer = cls(
+            capacity=payload["capacity"],
+            device=device or payload["device"],
+            state_keys=payload["state_keys"],
+            use_drq=payload.get("use_drq", True),
+            storage_device=payload.get("storage_device", "cpu"),
+            optimize_memory=payload.get("optimize_memory", False),
+        )
+        buffer.position = payload["position"]
+        buffer.size = payload["size"]
+        buffer.initialized = payload["initialized"]
+        buffer.has_complementary_info = payload.get("has_complementary_info", False)
+        buffer.complementary_info_keys = payload.get("complementary_info_keys", [])
+        if buffer.initialized:
+            if payload.get("compact", False):
+                buffer._restore_compact_payload(payload)
+            else:
+                buffer.states = {k: v.to(buffer.storage_device) for k, v in payload["states"].items()}
+                buffer.actions = payload["actions"].to(buffer.storage_device)
+                buffer.rewards = payload["rewards"].to(buffer.storage_device)
+                buffer.dones = payload["dones"].to(buffer.storage_device)
+                buffer.truncateds = payload["truncateds"].to(buffer.storage_device)
+                if not buffer.optimize_memory:
+                    buffer.next_states = {
+                        k: v.to(buffer.storage_device) for k, v in payload["next_states"].items()
+                    }
+                else:
+                    buffer.next_states = buffer.states
+                if buffer.has_complementary_info:
+                    buffer.complementary_info = {
+                        k: v.to(buffer.storage_device) for k, v in payload["complementary_info"].items()
+                    }
+        return buffer
+
     def to_lerobot_dataset(
         self,
         repo_id: str,
@@ -754,6 +1144,19 @@ def guess_feature_info(t, name: str):
         }
 
 
+def _complementary_info_for_batch(batch: BatchTransition) -> dict[str, torch.Tensor] | None:
+    """Return complementary_info, synthesizing base_action from action when missing."""
+    info = batch.get("complementary_info")
+    if info is not None and "base_action" in info:
+        return info
+    action = batch.get(ACTION)
+    if action is None:
+        return info
+    synthesized = dict(info) if info is not None else {}
+    synthesized["base_action"] = action.clone()
+    return synthesized
+
+
 def concatenate_batch_transitions(
     left_batch_transitions: BatchTransition, right_batch_transition: BatchTransition
 ) -> BatchTransition:
@@ -775,6 +1178,9 @@ def concatenate_batch_transitions(
     Warning:
         This function modifies the left_batch_transitions object in place.
     """
+    left_info = _complementary_info_for_batch(left_batch_transitions)
+    right_info = _complementary_info_for_batch(right_batch_transition)
+
     # Concatenate state fields
     left_batch_transitions["state"] = {
         key: torch.cat(
@@ -810,21 +1216,18 @@ def concatenate_batch_transitions(
         dim=0,
     )
 
-    # Handle complementary_info
-    left_info = left_batch_transitions.get("complementary_info")
-    right_info = right_batch_transition.get("complementary_info")
-
-    # Only process if right_info exists
+    # Handle complementary_info (computed before action tensors were merged)
+    if left_info is not None:
+        left_batch_transitions["complementary_info"] = left_info
     if right_info is not None:
-        # Initialize left complementary_info if needed
-        if left_info is None:
+        merged_info = left_batch_transitions.get("complementary_info")
+        if merged_info is None:
             left_batch_transitions["complementary_info"] = right_info
         else:
-            # Concatenate each field
             for key in right_info:
-                if key in left_info:
-                    left_info[key] = torch.cat([left_info[key], right_info[key]], dim=0)
+                if key in merged_info:
+                    merged_info[key] = torch.cat([merged_info[key], right_info[key]], dim=0)
                 else:
-                    left_info[key] = right_info[key]
+                    merged_info[key] = right_info[key]
 
     return left_batch_transitions

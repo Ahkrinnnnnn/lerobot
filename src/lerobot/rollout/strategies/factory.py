@@ -39,6 +39,14 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
         return BaseStrategy(config)
     if config.type == "deploy":
         return DeployStrategy(config)
+    if config.type == "pld_collect":
+        from .pld_collect import PLDCollectStrategy
+
+        return PLDCollectStrategy(config)
+    if config.type == "pld_hybrid_collect":
+        from .pld_hybrid_collect import PLDHybridCollectStrategy
+
+        return PLDHybridCollectStrategy(config)
     if config.type == "sentry":
         return SentryStrategy(config)
     if config.type == "highlight":
@@ -46,5 +54,5 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
     if config.type == "dagger":
         return DAggerStrategy(config)
     raise ValueError(
-        f"Unknown strategy type '{config.type}'. Available: base, deploy, sentry, highlight, dagger"
+        f"Unknown strategy type '{config.type}'. Available: base, deploy, pld_collect, pld_hybrid_collect, sentry, highlight, dagger"
     )

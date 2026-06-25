@@ -66,6 +66,45 @@ class DeployStrategyConfig(RolloutStrategyConfig):
     pass
 
 
+@RolloutStrategyConfig.register_subclass("pld_collect")
+@dataclass
+class PLDCollectStrategyConfig(RolloutStrategyConfig):
+    """PLD data collection for offline/online replay buffers."""
+
+    mode: str = "offline"  # offline | online
+    n_successful_trials: int = 20
+    max_episode_steps: int = 500
+    warmup_env_steps: int = 500
+    max_env_steps: int = 0  # 0 = until shutdown / trials reached
+    # Full manual scene-reset window after homing (homing time is not subtracted).
+    episode_reset_time_s: float = 15.0
+    manual_scene_reset_pause_key: str = "space"
+    # When True, reaching max_env_steps finishes the current episode before SAC (no mid-episode cut).
+    finish_episode_before_round_stop: bool = True
+
+    def __post_init__(self):
+        if self.mode not in ("offline", "online"):
+            raise ValueError(f"pld_collect mode must be 'offline' or 'online', got '{self.mode}'")
+
+
+@RolloutStrategyConfig.register_subclass("pld_hybrid_collect")
+@dataclass
+class PLDHybridCollectStrategyConfig(RolloutStrategyConfig):
+    """PLD Stage 2: per-episode hybrid rollout for SFT dataset collection."""
+
+    n_successful_episodes: int = 200
+    probing_alpha: float = 0.6
+    max_episode_steps: int = 1000
+    discard_failed_episodes: bool = True
+    seed: int | None = None
+    episode_reset_time_s: float = 15.0
+    manual_scene_reset_pause_key: str = "space"
+
+    def __post_init__(self):
+        if not 0.0 <= self.probing_alpha <= 1.0:
+            raise ValueError(f"probing_alpha must be in [0, 1], got {self.probing_alpha}")
+
+
 @RolloutStrategyConfig.register_subclass("sentry")
 @dataclass
 class SentryStrategyConfig(RolloutStrategyConfig):
@@ -241,7 +280,8 @@ class RolloutConfig:
 
         # TODO(Steven): DAgger shouldn't require a dataset (user may want to just rollout+intervene without recording), but for now we require it to simplify the implementation.
         needs_dataset = isinstance(
-            self.strategy, (SentryStrategyConfig, HighlightStrategyConfig, DAggerStrategyConfig)
+            self.strategy,
+            (SentryStrategyConfig, HighlightStrategyConfig, DAggerStrategyConfig, PLDHybridCollectStrategyConfig),
         )
         if needs_dataset and (self.dataset is None or not self.dataset.repo_id):
             raise ValueError(f"{self.strategy.type} strategy requires --dataset.repo_id to be set")
@@ -255,6 +295,14 @@ class RolloutConfig:
             raise ValueError(
                 "Deploy strategy does not record data. Use sentry, highlight, or dagger for recording."
             )
+
+        if isinstance(self.strategy, PLDCollectStrategyConfig) and self.dataset is not None:
+            raise ValueError("PLD collect strategy writes to replay buffers, not LeRobotDataset.")
+
+        if isinstance(self.strategy, PLDHybridCollectStrategyConfig) and self.dataset is not None:
+            if not self.dataset.streaming_encoding:
+                logger.warning("PLD hybrid collect forces streaming_encoding=True")
+                self.dataset.streaming_encoding = True
 
         # Sentry MUST use streaming encoding to avoid disk I/O blocking the control loop
         if (

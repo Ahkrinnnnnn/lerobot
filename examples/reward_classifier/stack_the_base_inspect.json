@@ -1,0 +1,10 @@
+{
+  "mode": "inspect",
+  "source": {
+    "repo_id": "local/stack_the_base_all",
+    "root": "/media/dingyuxuan/My Passport/stack_the_base_all"
+  },
+  "output": {
+    "report_path": "outputs/reward_classifier/reports/stack_the_base_inspect.json"
+  }
+}

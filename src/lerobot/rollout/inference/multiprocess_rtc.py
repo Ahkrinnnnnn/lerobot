@@ -463,7 +463,7 @@ class MultiprocessRTCInferenceEngine(InferenceEngine):
                     q_after,
                 )
             if q_after == 0:
-                logger.warning(
+                logger.debug(
                     "MultiprocessRTC merge emptied queue: chunk_len=%d delay_steps=%d "
                     "(inference %.2fs at fps=%.1f)",
                     processed.shape[0],

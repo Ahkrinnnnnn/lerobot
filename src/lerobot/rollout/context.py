@@ -306,6 +306,19 @@ def build_rollout_context(
         list(policy_action_names) if policy_action_names else None,
         raw_action_keys,
     )
+    try:
+        from lerobot.utils.constants import ACTION
+
+        policy_action_dim = int(policy.config.output_features[ACTION].shape[0])
+    except Exception:
+        policy_action_dim = None
+    logger.info(
+        "Debug action keys: ordered=%s raw_robot=%s policy_names=%s policy_dim=%s",
+        ordered_action_keys,
+        raw_action_keys,
+        policy_action_names,
+        policy_action_dim,
+    )
 
     # Validate visual features if no rename_map is active
     rename_map = cfg.rename_map
@@ -324,6 +337,7 @@ def build_rollout_context(
                 f"Policy expects: {expected_visuals}\n"
                 f"Robot provides: {provided_visuals}"
             )
+    logger.info("Debug: visual feature check passed")
 
     # --- 5. Dataset -------------
     dataset = None
@@ -378,8 +392,14 @@ def build_rollout_context(
 
     if dataset is not None:
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
+    else:
+        logger.info("Debug: no dataset configured (PLD collect / deploy-only mode)")
 
     # --- 6. Policy pre/post processors (needs dataset stats if any) ---
+    logger.info(
+        "Debug: loading policy pre/post processors from %s ...",
+        cfg.policy.pretrained_path,
+    )
     dataset_stats = None
     if dataset is not None:
         dataset_stats = rename_stats(
@@ -396,6 +416,7 @@ def build_rollout_context(
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         },
     )
+    logger.info("Debug: policy pre/post processors loaded")
 
     if isinstance(cfg.inference, SyncInferenceConfig) and any(
         isinstance(step, RelativeActionsProcessorStep) and step.enabled
@@ -426,6 +447,14 @@ def build_rollout_context(
             robot_type=robot_wrapper.robot_type,
         )
     else:
+        logger.info(
+            "Debug: creating inference engine (type=%s, multiprocess_rtc=%s) — "
+            "Pi0.5 spawn child may take 1–3 min on first run ...",
+            cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
+            getattr(cfg.inference, "multiprocess", False)
+            if hasattr(cfg.inference, "multiprocess")
+            else False,
+        )
         inference_strategy = create_inference_engine(
             cfg.inference,
             policy=policy,
@@ -443,6 +472,7 @@ def build_rollout_context(
             shutdown_event=shutdown_event,
             policy_obs_capture_fn=policy_obs_capture_fn,
         )
+    logger.info("Debug: inference engine ready (%s)", type(inference_strategy).__name__)
 
     # --- 8. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")

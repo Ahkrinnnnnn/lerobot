@@ -48,6 +48,7 @@ from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
+from .residual_gaussian.configuration_residual_gaussian import ResidualGaussianActorConfig
 from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
@@ -131,6 +132,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .gaussian_actor.modeling_gaussian_actor import GaussianActorPolicy
 
         return GaussianActorPolicy
+    elif name == "residual_gaussian":
+        from .residual_gaussian.modeling_residual_gaussian import ResidualGaussianActorPolicy
+
+        return ResidualGaussianActorPolicy
     elif name == "smolvla":
         from .smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -193,6 +198,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05Config(**kwargs)
     elif policy_type == "gaussian_actor":
         return GaussianActorConfig(**kwargs)
+    elif policy_type == "residual_gaussian":
+        return ResidualGaussianActorConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
     elif policy_type == "groot":
@@ -369,6 +376,14 @@ def make_pre_post_processors(
         from .gaussian_actor.processor_gaussian_actor import make_gaussian_actor_pre_post_processors
 
         processors = make_gaussian_actor_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ResidualGaussianActorConfig):
+        from .residual_gaussian.processor_residual_gaussian import make_residual_gaussian_pre_post_processors
+
+        processors = make_residual_gaussian_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
