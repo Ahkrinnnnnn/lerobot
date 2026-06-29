@@ -293,6 +293,7 @@ all = [
 
 [project.scripts]
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
+lerobot-calibrate-hand-eye="lerobot.scripts.lerobot_calibrate_hand_eye:main"
 lerobot-camera-stream="lerobot.scripts.lerobot_camera_stream:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"

@@ -1,0 +1,7 @@
+{
+  "squares_x": 8,
+  "squares_y": 11,
+  "square_size_mm": 15.0,
+  "marker_size_mm": 11.0,
+  "aruco_dict": "DICT_4X4_50"
+}

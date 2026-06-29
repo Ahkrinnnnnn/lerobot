@@ -1,0 +1,24 @@
+{
+  "robot": {
+    "type": "crp_arm",
+    "id": "lab_arm_01",
+    "port": "192.168.0.100",
+    "cameras": {
+      "top": {
+        "type": "opencv",
+        "index_or_path": 14,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      },
+      "wrist": {
+        "type": "opencv",
+        "index_or_path": 6,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      }
+    }
+  },
+  "board_config_path": "examples/hand_eye_calibration/charuco_board.json"
+}
