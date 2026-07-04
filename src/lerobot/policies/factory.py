@@ -53,6 +53,7 @@ from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
+from .rl_token.configuration_rlt import RLTConfig
 from .pretrained import PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
@@ -128,6 +129,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "rlt":
+        from .rl_token.modeling_rlt import RLTPolicy
+
+        return RLTPolicy
     elif name == "gaussian_actor":
         from .gaussian_actor.modeling_gaussian_actor import GaussianActorPolicy
 
@@ -196,6 +201,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "rlt":
+        return RLTConfig(**kwargs)
     elif policy_type == "gaussian_actor":
         return GaussianActorConfig(**kwargs)
     elif policy_type == "residual_gaussian":
@@ -370,6 +377,15 @@ def make_pre_post_processors(
         processors = make_pi05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, RLTConfig):
+        if policy_cfg.base_policy is None:
+            raise ValueError("RLT policy requires a configured base_policy for processors.")
+        return make_pre_post_processors(
+            policy_cfg.base_policy,
+            pretrained_path=pretrained_path,
+            **kwargs,
         )
 
     elif isinstance(policy_cfg, GaussianActorConfig):

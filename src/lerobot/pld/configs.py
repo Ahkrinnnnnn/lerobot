@@ -97,14 +97,9 @@ class PLDStage1Config:
     job_name: str = "pld_stage1"
 
     def __post_init__(self):
-        policy_path = parser.get_path_arg("base_policy")
-        if policy_path:
-            yaml_overrides = parser.get_yaml_overrides("base_policy")
-            cli_overrides = parser.get_cli_overrides("base_policy") or []
-            self.base_policy = PreTrainedConfig.from_pretrained(
-                policy_path, cli_overrides=yaml_overrides + cli_overrides
-            )
-            self.base_policy.pretrained_path = policy_path
+        loaded = parser.load_pretrained_config_from_path_field("base_policy")
+        if loaded is not None:
+            self.base_policy = loaded
         if self.base_policy is None:
             raise ValueError("--base_policy.path is required for PLD Stage 1")
 
@@ -202,14 +197,9 @@ class PLDStage2Config:
     job_name: str = "pld_stage2"
 
     def __post_init__(self):
-        policy_path = parser.get_path_arg("base_policy")
-        if policy_path:
-            yaml_overrides = parser.get_yaml_overrides("base_policy")
-            cli_overrides = parser.get_cli_overrides("base_policy") or []
-            self.base_policy = PreTrainedConfig.from_pretrained(
-                policy_path, cli_overrides=yaml_overrides + cli_overrides
-            )
-            self.base_policy.pretrained_path = policy_path
+        loaded = parser.load_pretrained_config_from_path_field("base_policy")
+        if loaded is not None:
+            self.base_policy = loaded
         if self.base_policy is None:
             raise ValueError("--base_policy.path is required for PLD Stage 2")
 

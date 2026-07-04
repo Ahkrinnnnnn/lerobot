@@ -1,0 +1,36 @@
+{
+  "dataset": {
+    "repo_id": "local/insert_the_blue_tube_all",
+    "root": "/media/dingyuxuan/My Passport/insert_the_blue_tube_all"
+  },
+  "policy": {
+    "type": "rlt",
+    "device": "cuda",
+    "rlt_finetune_vla": true,
+    "base_policy": {
+      "type": "pi05",
+      "path": "outputs/models/pi05_insert_the_blue_tube/checkpoints/140000/pretrained_model",
+      "dtype": "bfloat16",
+      "gradient_checkpointing": true,
+      "freeze_vision_encoder": false,
+      "train_expert_only": false,
+      "optimizer_lr": 2.5e-5,
+      "scheduler_warmup_steps": 1000,
+      "scheduler_decay_steps": 20000
+    }
+  },
+  "use_policy_training_preset": true,
+  "batch_size": 8,
+  "num_workers": 4,
+  "steps": 20000,
+  "log_freq": 50,
+  "save_freq": 5000,
+  "save_checkpoint": true,
+  "seed": 42,
+  "output_dir": "outputs/models/rlt_pi05_joint_sft_insert_the_blue_tube",
+  "job_name": "rlt_pi05_joint_sft_insert_the_blue_tube",
+  "wandb": {
+    "enable": false,
+    "project": "lerobot-rlt"
+  }
+}

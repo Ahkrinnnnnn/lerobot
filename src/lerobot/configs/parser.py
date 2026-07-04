@@ -181,6 +181,35 @@ def get_yaml_overrides(field_name: str) -> list[str]:
     return _config_yaml_overrides.get(field_name, [])
 
 
+def load_pretrained_config_from_path_field(field_name: str):
+    """Load a policy config from ``{field_name}.path`` (CLI or extracted JSON/YAML)."""
+    from pathlib import Path
+
+    from lerobot.configs.policies import PreTrainedConfig
+
+    policy_path = get_path_arg(field_name)
+    if not policy_path:
+        return None
+    yaml_overrides = get_yaml_overrides(field_name)
+    cli_overrides = get_cli_overrides(field_name) or []
+    config = PreTrainedConfig.from_pretrained(
+        policy_path,
+        cli_overrides=yaml_overrides + cli_overrides,
+    )
+    config.pretrained_path = Path(policy_path)
+    return config
+
+
+def _extract_path_in_dict(d: dict, field_name: str) -> bool:
+    """Pop ``path`` from *d*, store overrides; return True if ``path`` was present."""
+    if PATH_KEY not in d:
+        return False
+    _config_path_args[field_name] = str(d.pop(PATH_KEY))
+    if d:
+        _config_yaml_overrides[field_name] = _flatten_to_cli_args(d)
+    return True
+
+
 def get_type_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
     return parse_arg(f"{field_name}.{draccus.CHOICE_TYPE_KEY}", args)
 
@@ -250,13 +279,23 @@ def extract_path_fields_from_config(config_path: str, path_fields: list[str]) ->
 
     modified = False
     for field in path_fields:
-        if field in config_data and isinstance(config_data[field], dict) and PATH_KEY in config_data[field]:
-            _config_path_args[field] = str(config_data[field].pop(PATH_KEY))
-            remaining = config_data[field]
-            if remaining:
-                _config_yaml_overrides[field] = _flatten_to_cli_args(remaining)
-            else:
-                del config_data[field]
+        if field in config_data and isinstance(config_data[field], dict):
+            if _extract_path_in_dict(config_data[field], field):
+                if not config_data[field]:
+                    del config_data[field]
+                modified = True
+
+    for parent_key, child_key in (("policy", "base_policy"),):
+        nested_field = f"{parent_key}.{child_key}"
+        parent = config_data.get(parent_key)
+        if not isinstance(parent, dict):
+            continue
+        child = parent.get(child_key)
+        if not isinstance(child, dict):
+            continue
+        if _extract_path_in_dict(child, nested_field):
+            if not child:
+                del parent[child_key]
             modified = True
 
     if not modified:

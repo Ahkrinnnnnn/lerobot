@@ -1,0 +1,36 @@
+{
+  "dataset": {
+    "repo_id": "local/insert_the_blue_tube_all",
+    "root": "/media/lenovo/My Passport/insert_the_blue_tube_all"
+  },
+  "policy": {
+    "type": "rlt",
+    "device": "cuda",
+    "rlt_finetune_vla": false,
+    "rlt_optimizer_lr": 0.0001,
+    "rlt_scheduler_warmup_steps": 500,
+    "rlt_scheduler_decay_steps": 10000,
+    "base_policy": {
+      "type": "pi05",
+      "path": "outputs/models/pi05_insert_the_blue_tube/checkpoints/140000/pretrained_model",
+      "dtype": "bfloat16",
+      "gradient_checkpointing": true
+    }
+  },
+  "use_policy_training_preset": true,
+  "batch_size": 8,
+  "num_workers": 4,
+  "steps": 10000,
+  "log_freq": 50,
+  "save_freq": 2500,
+  "save_checkpoint": true,
+  "seed": 42,
+  "output_dir": "outputs/models/rlt_pi05_token_only_insert_the_blue_tube",
+  "job_name": "rlt_pi05_token_only_insert_the_blue_tube",
+  "wandb": {
+    "enable": true,
+    "project": "lerobot-rlt",
+    "notes": "token_only insert_the_blue_tube",
+    "disable_artifact": true
+  }
+}
