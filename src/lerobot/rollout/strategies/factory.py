@@ -47,6 +47,10 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
         from .pld_hybrid_collect import PLDHybridCollectStrategy
 
         return PLDHybridCollectStrategy(config)
+    if config.type == "rlt_collect":
+        from .rlt_collect import RLTCollectStrategy
+
+        return RLTCollectStrategy(config)
     if config.type == "sentry":
         return SentryStrategy(config)
     if config.type == "highlight":

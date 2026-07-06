@@ -67,6 +67,10 @@ def get_algorithm_class(name: str) -> type[RLAlgorithm]:
         from .residual_sac.residual_sac_algorithm import ResidualSACAlgorithm
 
         return ResidualSACAlgorithm
+    if name == "rlt_td3":
+        from .rlt_td3.rlt_td3_algorithm import RLTTD3Algorithm
+
+        return RLTTD3Algorithm
     raise ValueError(
         f"Algorithm type '{name}' is not available. "
         f"Known: {list(RLAlgorithmConfig.get_known_choices().keys())}"

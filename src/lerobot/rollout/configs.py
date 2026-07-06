@@ -87,6 +87,40 @@ class PLDCollectStrategyConfig(RolloutStrategyConfig):
             raise ValueError(f"pld_collect mode must be 'offline' or 'online', got '{self.mode}'")
 
 
+@RolloutStrategyConfig.register_subclass("rlt_collect")
+@dataclass
+class RLTCollectStrategyConfig(RolloutStrategyConfig):
+    """RLT Stage-2 online rollout: chunked open-loop execution + step-trace replay.
+
+    The frozen base VLA + RL token module run in-process at chunk boundaries
+    (no RTC engine): each boundary produces ``(z_rl, ã_{1:C})``; the trainable
+    actor refines the chunk (or the VLA reference is executed directly during
+    warmup). The chunk is executed open-loop for ``C`` ticks while a raw
+    per-tick step trace is recorded; at episode end the trace is sliced into
+    replay windows (see :mod:`lerobot.rlt.replay_windows`).
+    """
+
+    mode: str = "online"  # online | eval
+    max_episode_steps: int = 500
+    # Minimum replay-buffer size before the actor is allowed to drive the robot.
+    warmup_min_buffer_size: int = 0
+    # Number of warmup actor-pretraining updates to run before the first collect.
+    warmup_pretraining_updates: int = 0
+    # Window stride (env steps). 0 = one window per chunk boundary.
+    replay_stride: int = 0
+    max_env_steps: int = 0  # 0 = until shutdown / trials reached
+    n_successful_trials: int = 0  # 0 = no success gate (online mode)
+    episode_reset_time_s: float = 15.0
+    manual_scene_reset_pause_key: str = "space"
+    finish_episode_before_round_stop: bool = True
+    # Discount used when aggregating per-step rewards into a chunk return.
+    chunk_return_discount: float = 0.99
+
+    def __post_init__(self):
+        if self.mode not in ("online", "eval"):
+            raise ValueError(f"rlt_collect mode must be 'online' or 'eval', got '{self.mode}'")
+
+
 @RolloutStrategyConfig.register_subclass("pld_hybrid_collect")
 @dataclass
 class PLDHybridCollectStrategyConfig(RolloutStrategyConfig):

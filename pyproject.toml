@@ -316,6 +316,7 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-deploy-v2="lerobot.scripts.lerobot_deploy_v2:main"
 lerobot-pld-stage1="lerobot.scripts.lerobot_pld_stage1:main"
 lerobot-pld-stage2="lerobot.scripts.lerobot_pld_stage2:main"
+lerobot-rlt-stage2="lerobot.scripts.lerobot_rlt_stage2:main"
 lerobot-reward-classifier="lerobot.scripts.lerobot_reward_classifier:main"
 lerobot-filter-replay-buffer="lerobot.scripts.lerobot_filter_replay_buffer:main"
 

@@ -56,23 +56,27 @@ class RLTPolicy(PreTrainedPolicy):
         dataset_meta: LeRobotDatasetMetadata | None = None,
         env_cfg: EnvConfig | None = None,
         rename_map: dict[str, str] | None = None,
+        base_policy: PreTrainedPolicy | None = None,
         **kwargs: Any,
     ):
         super().__init__(config)
         config.validate_features()
 
-        from lerobot.policies.factory import make_policy
+        if base_policy is not None:
+            self.base_policy = base_policy
+        else:
+            from lerobot.policies.factory import make_policy
 
-        ds_meta = ds_meta or dataset_meta
-        if ds_meta is None and env_cfg is None:
-            raise ValueError("RLTPolicy requires ds_meta or env_cfg to instantiate the base policy.")
+            ds_meta = ds_meta or dataset_meta
+            if ds_meta is None and env_cfg is None:
+                raise ValueError("RLTPolicy requires ds_meta or env_cfg to instantiate the base policy.")
 
-        self.base_policy = make_policy(
-            cfg=config.base_policy,
-            ds_meta=ds_meta,
-            env_cfg=env_cfg,
-            rename_map=rename_map,
-        )
+            self.base_policy = make_policy(
+                cfg=config.base_policy,
+                ds_meta=ds_meta,
+                env_cfg=env_cfg,
+                rename_map=rename_map,
+            )
         self.backbone = create_rlt_backbone(self.base_policy)
         self.rlt_module = RLTStage1Module(config.to_rl_token_config())
         if config.device is not None:

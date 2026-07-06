@@ -26,6 +26,7 @@ from .algorithms.factory import (
     make_algorithm_config as make_algorithm_config,
 )
 from .algorithms.sac.configuration_sac import SACAlgorithmConfig as SACAlgorithmConfig
+from .async_runner import AsyncActorLearnerRunner as AsyncActorLearnerRunner, WeightSlot as WeightSlot
 from .buffer import ReplayBuffer as ReplayBuffer
 from .data_sources import DataMixer as DataMixer, OnlineOfflineMixer as OnlineOfflineMixer
 from .trainer import RLTrainer as RLTrainer
@@ -41,4 +42,6 @@ __all__ = [
     "ReplayBuffer",
     "DataMixer",
     "OnlineOfflineMixer",
+    "AsyncActorLearnerRunner",
+    "WeightSlot",
 ]
