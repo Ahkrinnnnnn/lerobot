@@ -16,7 +16,13 @@ from .adapters import HandEyeRobot, as_hand_eye_robot
 from .board_config import CharucoBoardConfig
 from .chessboard import CameraIntrinsics
 from .config import CalibrationPhase, HandEyeCalibrationConfig
-from .hand_eye import CameraMount, HandEyeSample, hand_eye_target_origin_std, solve_hand_eye
+from .hand_eye import (
+    CameraMount,
+    HandEyeSample,
+    hand_eye_target_origin_std,
+    robot_to_board_from_eye_in_hand,
+    solve_hand_eye,
+)
 from .io import (
     default_scene_calibration_path,
     describe_npz,
@@ -32,6 +38,7 @@ from .runner import (
     run_hand_eye_calibration,
     run_intrinsics_calibration,
     run_landmark_map_calibration,
+    run_top_extrinsic_dual_calibration,
     validate_scene_calibration,
 )
 from .scene import CameraCalibration, RobotPoseFrame, SceneCalibration, TableCalibration
@@ -65,11 +72,13 @@ __all__ = [
     "load_scene_calibration",
     "make_transform",
     "print_methods_help",
+    "robot_to_board_from_eye_in_hand",
     "robot_to_landmark_from_eye_in_hand",
     "run_camera_via_landmark_calibration",
     "run_hand_eye_calibration",
     "run_intrinsics_calibration",
     "run_landmark_map_calibration",
+    "run_top_extrinsic_dual_calibration",
     "save_scene_calibration",
     "solve_hand_eye",
     "transform_to_list",

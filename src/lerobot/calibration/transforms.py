@@ -17,24 +17,79 @@
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
 
+def _axis_rotation(axis: str, angle_rad: float) -> np.ndarray:
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+
+    if axis == "x":
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+    if axis == "y":
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+    if axis == "z":
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+
+    raise ValueError(f"Unknown Euler axis: {axis!r}")
+
+
 def rotation_matrix_from_euler_xyz_deg(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
-    """Build R = Rz(yaw) @ Ry(pitch) @ Rx(roll) from degrees (CRP ``read_end_pose_*`` convention)."""
-    roll = math.radians(roll_deg)
-    pitch = math.radians(pitch_deg)
-    yaw = math.radians(yaw_deg)
+    """Build rotation matrix from CRP ``[roll, pitch, yaw]`` in degrees.
 
-    cx, sx = math.cos(roll), math.sin(roll)
-    cy, sy = math.cos(pitch), math.sin(pitch)
-    cz, sz = math.cos(yaw), math.sin(yaw)
+    The CRP controller's displayed RPY convention may differ from the default
+    assumption. Use env vars to test conventions without editing code:
 
-    rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)
-    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
-    rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
-    return rz @ ry @ rx
+        CRP_RPY_ORDER=xyz / XYZ / zyx / ZYX / xzy / XZY / yxz / YXZ / yzx / YZX / zxy / ZXY
+        CRP_RPY_SIGNS=1,1,1 or -1,1,1 etc.
+        CRP_RPY_INVERT=1 to use R.T
+
+    Lowercase means fixed-axis/extrinsic composition.
+    Uppercase means body-axis/intrinsic composition.
+    """
+
+    order = os.getenv("CRP_RPY_ORDER", "xyz").strip()
+    if len(order) != 3 or {c.lower() for c in order} != {"x", "y", "z"}:
+        raise ValueError(f"Invalid CRP_RPY_ORDER={order!r}; expected permutation like xyz, ZYX, etc.")
+
+    raw_signs = os.getenv("CRP_RPY_SIGNS", "1,1,1").strip()
+    signs = [float(v) for v in raw_signs.split(",")]
+    if len(signs) != 3:
+        raise ValueError(f"Invalid CRP_RPY_SIGNS={raw_signs!r}; expected e.g. 1,1,1 or -1,1,1")
+
+    roll_deg *= signs[0]
+    pitch_deg *= signs[1]
+    yaw_deg *= signs[2]
+
+    angle_by_axis_deg = {
+        "x": roll_deg,
+        "y": pitch_deg,
+        "z": yaw_deg,
+    }
+
+    mats = [
+        _axis_rotation(axis.lower(), math.radians(angle_by_axis_deg[axis.lower()]))
+        for axis in order
+    ]
+
+    if order.islower():
+        # Extrinsic/fixed-axis: xyz -> Rz @ Ry @ Rx, matching the old behavior.
+        r = mats[0]
+        for m in mats[1:]:
+            r = m @ r
+    elif order.isupper():
+        # Intrinsic/body-axis: XYZ -> Rx @ Ry @ Rz.
+        r = mats[0]
+        for m in mats[1:]:
+            r = r @ m
+    else:
+        raise ValueError(f"Use all-lowercase or all-uppercase CRP_RPY_ORDER, got {order!r}")
+
+    if os.getenv("CRP_RPY_INVERT", "0").lower() in ("1", "true", "yes"):
+        r = r.T
+
+    return r
 
 
 def make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
@@ -54,11 +109,20 @@ def transform_from_xyz_rpy_deg(
     pitch_deg: float,
     yaw_deg: float,
 ) -> np.ndarray:
-    """Build ``T`` from CRP-style pose ``[x, y, z, roll, pitch, yaw]`` (mm + degrees)."""
-    return make_transform(
+    """Build ``T`` from CRP-style pose ``[x, y, z, roll, pitch, yaw]`` (mm + degrees).
+
+    Env:
+        CRP_POSE_INVERT=1 tests whether the CRP returned pose should be used as inverse(T).
+    """
+    T = make_transform(
         rotation_matrix_from_euler_xyz_deg(roll_deg, pitch_deg, yaw_deg),
         np.array([x, y, z], dtype=np.float64),
     )
+
+    if os.getenv("CRP_POSE_INVERT", "0").lower() in ("1", "true", "yes"):
+        T = invert_transform(T)
+
+    return T
 
 
 def invert_transform(transform: np.ndarray) -> np.ndarray:

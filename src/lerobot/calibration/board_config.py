@@ -44,6 +44,13 @@ def resolve_aruco_dict(name: str) -> int:
     return ARUCO_DICT_BY_NAME[key]
 
 
+ARUCO_DICT_NAME_BY_ID: dict[int, str] = {v: k for k, v in ARUCO_DICT_BY_NAME.items()}
+
+
+def aruco_dict_to_name(aruco_id: int) -> str:
+    return ARUCO_DICT_NAME_BY_ID.get(aruco_id, str(aruco_id))
+
+
 @dataclass
 class CharucoBoardConfig:
     """Printed ChArUco board geometry."""
@@ -78,7 +85,7 @@ class CharucoBoardConfig:
             "aruco_dict": self.aruco_dict,
         }
 
-    def to_target(self):
+    def to_target(self) -> CalibrationTargetConfig:
         from .target import CalibrationTargetConfig
 
         return CalibrationTargetConfig(
@@ -87,4 +94,14 @@ class CharucoBoardConfig:
             square_size_mm=self.square_size_mm,
             marker_size_mm=self.marker_size_mm,
             aruco_dict=resolve_aruco_dict(self.aruco_dict),
+        )
+
+    @classmethod
+    def from_target(cls, target: CalibrationTargetConfig) -> CharucoBoardConfig:
+        return cls(
+            squares_x=target.squares_x,
+            squares_y=target.squares_y,
+            square_size_mm=target.square_size_mm,
+            marker_size_mm=target.marker_size_mm,
+            aruco_dict=aruco_dict_to_name(target.aruco_dict),
         )

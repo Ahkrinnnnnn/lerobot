@@ -39,12 +39,15 @@ class CharucoConfig:
 
 def make_charuco_board(config: CharucoConfig) -> cv2.aruco.CharucoBoard:
     dictionary = cv2.aruco.getPredefinedDictionary(config.aruco_dict)
-    return cv2.aruco.CharucoBoard(
+    board = cv2.aruco.CharucoBoard(
         (config.squares_x, config.squares_y),
         float(config.square_size),
         float(config.marker_size),
         dictionary,
     )
+    if hasattr(board, "setLegacyPattern"):
+        board.setLegacyPattern(True)
+    return board
 
 
 def make_charuco_detector(config: CharucoConfig) -> cv2.aruco.CharucoDetector:
@@ -89,6 +92,52 @@ def estimate_charuco_to_camera(
     return make_transform(rotation.astype(np.float64), tvec.reshape(3))
 
 
+def _default_axis_length_mm(config: CharucoConfig) -> float:
+    return float(config.square_size) * 3.0
+
+
+def draw_board_frame_axes(
+    vis_bgr: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    T_target_to_camera: np.ndarray,
+    *,
+    axis_length_mm: float | None = None,
+    config: CharucoConfig | None = None,
+) -> None:
+    """Draw ChArUco board frame on ``vis_bgr`` (BGR): X=red, Y=green, Z=blue (OpenCV)."""
+    length = axis_length_mm
+    if length is None:
+        length = _default_axis_length_mm(config) if config is not None else 60.0
+    R = T_target_to_camera[:3, :3]
+    t = T_target_to_camera[:3, 3].reshape(3, 1)
+    rvec, _ = cv2.Rodrigues(R)
+    cv2.drawFrameAxes(
+        vis_bgr,
+        intrinsics.camera_matrix,
+        intrinsics.dist_coeffs,
+        rvec,
+        t,
+        float(length),
+        3,
+    )
+    obj_pts = np.array(
+        [[0.0, 0.0, 0.0], [length, 0.0, 0.0], [0.0, length, 0.0], [0.0, 0.0, length]],
+        dtype=np.float64,
+    )
+    img_pts, _ = cv2.projectPoints(
+        obj_pts,
+        rvec,
+        t,
+        intrinsics.camera_matrix,
+        intrinsics.dist_coeffs,
+    )
+    labels = ("O", "X", "Y", "Z")
+    colors = ((255, 255, 255), (0, 0, 255), (0, 255, 0), (255, 0, 0))
+    for i, (label, color) in enumerate(zip(labels, colors, strict=True)):
+        x, y = int(round(img_pts[i, 0, 0])), int(round(img_pts[i, 0, 1]))
+        cv2.putText(vis_bgr, label, (x + 4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+
 def calibrate_charuco_intrinsics(
     images: list[np.ndarray],
     config: CharucoConfig,
@@ -97,31 +146,39 @@ def calibrate_charuco_intrinsics(
         raise ValueError("Need >= 3 ChArUco views for intrinsics calibration.")
 
     board = make_charuco_board(config)
-    all_corners: list[np.ndarray] = []
-    all_ids: list[np.ndarray] = []
+
+    object_points: list[np.ndarray] = []
+    image_points: list[np.ndarray] = []
     image_size: tuple[int, int] | None = None
 
     for image in images:
         detected = detect_charuco(image, config)
         if detected is None:
             continue
+
         corners, ids = detected
         h, w = image.shape[:2]
         image_size = (w, h)
-        all_corners.append(corners)
-        all_ids.append(ids)
 
-    if image_size is None or len(all_corners) < 3:
-        raise RuntimeError(f"ChArUco visible in only {len(all_corners)} images; need >= 3.")
+        obj_pts, img_pts = board.matchImagePoints(corners, ids)
 
-    rms, camera_matrix, dist_coeffs, _, _ = cv2.aruco.calibrateCameraCharuco(
-        all_corners,
-        all_ids,
-        board,
+        if obj_pts is None or img_pts is None or len(obj_pts) < 4:
+            continue
+
+        object_points.append(obj_pts.astype(np.float32))
+        image_points.append(img_pts.astype(np.float32))
+
+    if image_size is None or len(object_points) < 3:
+        raise RuntimeError(f"ChArUco visible in only {len(object_points)} images; need >= 3.")
+
+    rms, camera_matrix, dist_coeffs, _, _ = cv2.calibrateCamera(
+        object_points,
+        image_points,
         image_size,
         None,
         None,
     )
+
     return CameraIntrinsics(
         width=image_size[0],
         height=image_size[1],
@@ -131,19 +188,46 @@ def calibrate_charuco_intrinsics(
     )
 
 
-def draw_charuco(image: np.ndarray, config: CharucoConfig) -> tuple[np.ndarray, bool]:
+def draw_charuco(
+    image: np.ndarray,
+    config: CharucoConfig,
+    *,
+    intrinsics: CameraIntrinsics | None = None,
+    T_target_to_camera: np.ndarray | None = None,
+    axis_length_mm: float | None = None,
+) -> tuple[np.ndarray, bool]:
     vis = np.asarray(image).copy()
     if vis.ndim == 2:
         vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
     elif vis.shape[2] == 3:
         vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
     detected = detect_charuco(image, config)
     if detected is None:
         return vis, False
-    corners, ids = detected
-    cv2.aruco.drawDetectedCornersCharuco(vis, corners, ids)
-    return vis, True
 
+    corners, ids = detected
+
+    # OpenCV 4.13/5.0 may reject the returned corner/id shapes during drawing.
+    # Drawing is only visualization; calibration can continue without it.
+    try:
+        cv2.aruco.drawDetectedCornersCharuco(vis, corners, ids)
+    except cv2.error as e:
+        print(f"[WARN] drawDetectedCornersCharuco failed, skip drawing only: {e}")
+
+    T_board = T_target_to_camera
+    if intrinsics is not None and T_board is None:
+        T_board = estimate_charuco_to_camera(image, intrinsics, config)
+    if intrinsics is not None and T_board is not None:
+        draw_board_frame_axes(
+            vis,
+            intrinsics,
+            T_board,
+            axis_length_mm=axis_length_mm,
+            config=config,
+        )
+
+    return vis, True
 
 def charuco_corner_points_board_mm(config: CharucoConfig) -> list[np.ndarray]:
     """Inner chessboard corners in ChArUco board frame (Z=0, mm)."""

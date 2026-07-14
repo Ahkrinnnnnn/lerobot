@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .hand_eye import CameraMount
+from .hand_eye import CameraMount, robot_to_board_from_eye_in_hand
 from .scene import SceneCalibration, TableCalibration
 from .target import CalibrationTargetConfig, grid_points_in_robot_frame
 from .transforms import average_rotation_matrices, compose_transforms, invert_transform, make_transform, transform_to_list
@@ -41,7 +41,8 @@ def robot_to_landmark_from_eye_in_hand(
     T_ee_to_camera: np.ndarray,
     T_landmark_to_camera: np.ndarray,
 ) -> np.ndarray:
-    return compose_transforms(T_robot_to_ee, compose_transforms(T_ee_to_camera, T_landmark_to_camera))
+    """Alias for :func:`robot_to_board_from_eye_in_hand` (landmark = fixed board)."""
+    return robot_to_board_from_eye_in_hand(T_robot_to_ee, T_ee_to_camera, T_landmark_to_camera)
 
 
 def camera_extrinsic_from_landmark(

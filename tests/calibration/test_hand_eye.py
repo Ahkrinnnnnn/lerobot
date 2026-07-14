@@ -14,7 +14,14 @@
 
 import numpy as np
 
-from lerobot.calibration.hand_eye import CameraMount, HandEyeSample, solve_hand_eye
+from lerobot.calibration.hand_eye import (
+    CameraMount,
+    HandEyeSample,
+    per_sample_board_origin_mm,
+    robot_to_board_from_eye_in_hand,
+    solve_hand_eye,
+)
+from lerobot.calibration.landmark import robot_to_landmark_from_eye_in_hand
 from lerobot.calibration.transforms import compose_transforms, invert_transform, make_transform
 
 
@@ -47,6 +54,25 @@ def test_solve_eye_in_hand_recovers_extrinsics():
     gt, samples = _synthesize_eye_in_hand_samples(12)
     est = solve_hand_eye(samples, CameraMount.EYE_IN_HAND)
     assert np.allclose(gt, est, atol=1e-2)
+
+
+def test_robot_to_board_three_transform_chain():
+    gt, samples = _synthesize_eye_in_hand_samples(8, seed=1)
+    t_robot_to_target = robot_to_board_from_eye_in_hand(
+        samples[0].T_robot_to_ee, gt, samples[0].T_target_to_camera
+    )
+    for sample in samples:
+        via_helper = robot_to_board_from_eye_in_hand(
+            sample.T_robot_to_ee, gt, sample.T_target_to_camera
+        )
+        via_landmark = robot_to_landmark_from_eye_in_hand(
+            sample.T_robot_to_ee, gt, sample.T_target_to_camera
+        )
+        assert np.allclose(via_helper, via_landmark)
+        assert np.allclose(via_helper, t_robot_to_target, atol=1e-6)
+
+    origins = per_sample_board_origin_mm(samples, CameraMount.EYE_IN_HAND, gt)
+    assert np.allclose(origins, np.tile(t_robot_to_target[:3, 3], (len(samples), 1)), atol=1e-6)
 
 
 def test_scene_npz_roundtrip(tmp_path):

@@ -22,7 +22,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .board_config import ARUCO_DICT_BY_NAME, resolve_aruco_dict
+from .board_config import CharucoBoardConfig
 from .charuco import (
     CharucoConfig,
     calibrate_charuco_intrinsics,
@@ -31,9 +31,6 @@ from .charuco import (
     table_grid_points_robot_mm,
 )
 from .chessboard import CameraIntrinsics
-
-
-_ARUCO_DICT_NAME_BY_ID = {v: k for k, v in ARUCO_DICT_BY_NAME.items()}
 
 
 @dataclass
@@ -57,28 +54,16 @@ class CalibrationTargetConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "squares_x": self.squares_x,
-            "squares_y": self.squares_y,
-            "square_size_mm": self.square_size_mm,
-            "marker_size_mm": self.marker_size_mm,
-            "aruco_dict": _ARUCO_DICT_NAME_BY_ID.get(self.aruco_dict, str(self.aruco_dict)),
-        }
+        return CharucoBoardConfig.from_target(self).to_dict()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CalibrationTargetConfig:
-        raw_dict = data.get("aruco_dict", "DICT_4X4_50")
-        if isinstance(raw_dict, str):
-            aruco_dict = resolve_aruco_dict(raw_dict)
-        else:
-            aruco_dict = int(raw_dict)
-        return cls(
-            squares_x=int(data.get("squares_x", 8)),
-            squares_y=int(data.get("squares_y", 11)),
-            square_size_mm=float(data.get("square_size_mm", 15.0)),
-            marker_size_mm=float(data.get("marker_size_mm", 11.0)),
-            aruco_dict=aruco_dict,
-        )
+        """Parse board JSON or scene ``charuco`` block (same keys as ``charuco_board.json``)."""
+        return CharucoBoardConfig.from_dict(data).to_target()
+
+    @classmethod
+    def from_board_config(cls, board: CharucoBoardConfig) -> CalibrationTargetConfig:
+        return board.to_target()
 
 
 def calibrate_intrinsics(images: list[np.ndarray], target: CalibrationTargetConfig) -> CameraIntrinsics:
@@ -100,8 +85,21 @@ def detect_target(image: np.ndarray, target: CalibrationTargetConfig) -> bool:
     return detect_charuco(image, target.charuco()) is not None
 
 
-def draw_target(image: np.ndarray, target: CalibrationTargetConfig) -> tuple[np.ndarray, bool]:
-    vis, found = draw_charuco(image, target.charuco())
+def draw_target(
+    image: np.ndarray,
+    target: CalibrationTargetConfig,
+    *,
+    intrinsics: CameraIntrinsics | None = None,
+    T_target_to_camera: np.ndarray | None = None,
+    axis_length_mm: float | None = None,
+) -> tuple[np.ndarray, bool]:
+    vis, found = draw_charuco(
+        image,
+        target.charuco(),
+        intrinsics=intrinsics,
+        T_target_to_camera=T_target_to_camera,
+        axis_length_mm=axis_length_mm,
+    )
     if vis.ndim == 3 and vis.shape[2] == 3:
         vis = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
     return vis, found

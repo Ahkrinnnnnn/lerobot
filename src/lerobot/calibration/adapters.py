@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -25,6 +26,8 @@ from lerobot.robots.robot import Robot
 
 from .scene import RobotPoseFrame
 from .transforms import transform_from_xyz_rpy_deg
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -42,6 +45,19 @@ class HandEyeRobot(Protocol):
     def read_robot_to_ee(self, frame: RobotPoseFrame) -> np.ndarray:
         """Return ``T_robot_to_ee`` as 4x4 (mm + deg, robot-specific frame)."""
         ...
+
+
+@runtime_checkable
+class ManualCapableHandEyeRobot(HandEyeRobot, Protocol):
+    """Robot that can switch to manual teach mode for interactive calibration."""
+
+    def prepare_manual_calibration(self) -> None:
+        """Switch robot to manual teach mode before interactive calibration."""
+        ...
+
+
+def has_manual_calibration(robot: HandEyeRobot) -> bool:
+    return isinstance(robot, ManualCapableHandEyeRobot)
 
 
 class CrpArmHandEyeAdapter:
@@ -74,6 +90,20 @@ class CrpArmHandEyeAdapter:
         else:
             x, y, z, roll, pitch, yaw = self._robot.crp_arm_robot.read_end_pose_world()
         return transform_from_xyz_rpy_deg(x, y, z, roll, pitch, yaw)
+
+    def read_robot_pose_6d(self, frame: RobotPoseFrame) -> list[float]:
+        """CRP raw ``[x, y, z, roll, pitch, yaw]`` (mm + deg) for debug logging."""
+        if frame == RobotPoseFrame.USER:
+            return [float(v) for v in self._robot.crp_arm_robot.read_end_pose_user()]
+        return [float(v) for v in self._robot.crp_arm_robot.read_end_pose_world()]
+
+    def prepare_manual_calibration(self) -> None:
+        """Manual mode: operator drags the arm on the teach pendant."""
+        from lerobot.robots.crp_arm._sdk import import_crp_robot_py
+
+        _, RobotMode = import_crp_robot_py()
+        self._robot.crp_arm_robot.switch_work_mode(RobotMode.Manual)
+        logger.info("CRP calibration: Manual mode (drag arm on teach pendant)")
 
 
 def as_hand_eye_robot(robot: Robot) -> HandEyeRobot:
