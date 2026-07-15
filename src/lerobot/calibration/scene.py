@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from .hand_eye import CameraMount
-from .transforms import transform_from_list, transform_to_list
+from .transforms import invert_transform, transform_from_list, transform_to_list
 
 
 class RobotPoseFrame(str, Enum):
@@ -39,7 +39,7 @@ class CameraCalibration:
     camera_matrix: list[list[float]]
     dist_coeffs: list[float]
     reprojection_error: float | None = None
-    T_robot_to_camera: list[list[float]] | None = None
+    T_camera_to_robot: list[list[float]] | None = None
     T_ee_to_camera: list[list[float]] | None = None
 
     def camera_matrix_np(self) -> np.ndarray:
@@ -51,7 +51,7 @@ class CameraCalibration:
 
 @dataclass
 class TableCalibration:
-    T_robot_to_table: list[list[float]]
+    T_table_to_robot: list[list[float]]
     grid_points_robot_mm: list[list[float]] = field(default_factory=list)
     notes: str = ""
 
@@ -72,7 +72,7 @@ class SceneCalibration:
 
     def to_dict(self) -> dict[str, Any]:
         intrinsics: dict[str, Any] = {}
-        T_robot_to_camera: dict[str, list[list[float]]] = {}
+        T_camera_to_robot: dict[str, list[list[float]]] = {}
         T_ee_to_camera: dict[str, list[list[float]]] = {}
         mounts: dict[str, str] = {}
 
@@ -85,8 +85,8 @@ class SceneCalibration:
                 "dist_coeffs": cam.dist_coeffs,
                 "reprojection_error": cam.reprojection_error,
             }
-            if cam.T_robot_to_camera is not None:
-                T_robot_to_camera[name] = cam.T_robot_to_camera
+            if cam.T_camera_to_robot is not None:
+                T_camera_to_robot[name] = cam.T_camera_to_robot
             if cam.T_ee_to_camera is not None:
                 T_ee_to_camera[name] = cam.T_ee_to_camera
 
@@ -102,12 +102,12 @@ class SceneCalibration:
         }
         if self.charuco is not None:
             out["charuco"] = self.charuco
-        if T_robot_to_camera:
-            out["T_robot_to_camera"] = T_robot_to_camera
+        if T_camera_to_robot:
+            out["T_camera_to_robot"] = T_camera_to_robot
         if T_ee_to_camera:
             out["T_ee_to_camera"] = T_ee_to_camera
         if self.table is not None:
-            out["T_robot_to_table"] = self.table.T_robot_to_table
+            out["T_table_to_robot"] = self.table.T_table_to_robot
             out["table_grid_points_robot_mm"] = self.table.grid_points_robot_mm
             if self.table.notes:
                 out["table_notes"] = self.table.notes
@@ -120,7 +120,7 @@ class SceneCalibration:
 
         if version >= 2 and "intrinsics" in data:
             mounts = data.get("camera_mounts", {})
-            T_rtc = data.get("T_robot_to_camera", {})
+            T_rtc = data.get("T_camera_to_robot") or data.get("T_robot_to_camera", {})
             T_eec = data.get("T_ee_to_camera", {})
             for name, intr in data["intrinsics"].items():
                 cameras[name] = CameraCalibration(
@@ -130,7 +130,7 @@ class SceneCalibration:
                     camera_matrix=intr["camera_matrix"],
                     dist_coeffs=intr["dist_coeffs"],
                     reprojection_error=intr.get("reprojection_error"),
-                    T_robot_to_camera=T_rtc.get(name),
+                    T_camera_to_robot=T_rtc.get(name),
                     T_ee_to_camera=T_eec.get(name),
                 )
         else:
@@ -142,20 +142,21 @@ class SceneCalibration:
                     camera_matrix=cam["camera_matrix"],
                     dist_coeffs=cam["dist_coeffs"],
                     reprojection_error=cam.get("reprojection_error"),
-                    T_robot_to_camera=cam.get("T_robot_to_camera"),
+                    T_camera_to_robot=cam.get("T_camera_to_robot", cam.get("T_robot_to_camera")),
                     T_ee_to_camera=cam.get("T_ee_to_camera"),
                 )
 
         table = None
-        if "T_robot_to_table" in data:
+        T_table = data.get("T_table_to_robot", data.get("T_robot_to_table"))
+        if T_table is not None:
             table = TableCalibration(
-                T_robot_to_table=data["T_robot_to_table"],
+                T_table_to_robot=T_table,
                 grid_points_robot_mm=data.get("table_grid_points_robot_mm", []),
                 notes=data.get("table_notes", data.get("table", {}).get("notes", "")),
             )
         elif table_data := data.get("table"):
             table = TableCalibration(
-                T_robot_to_table=table_data["T_robot_to_table"],
+                T_table_to_robot=table_data.get("T_table_to_robot", table_data.get("T_robot_to_table")),
                 grid_points_robot_mm=table_data.get("grid_points_robot_mm", []),
                 notes=table_data.get("notes", ""),
             )
@@ -176,32 +177,33 @@ class SceneCalibration:
             table=table,
         )
 
-    def get_T_robot_to_camera(self, camera_name: str, T_robot_to_ee: np.ndarray | None = None) -> np.ndarray:
+    def get_T_camera_to_robot(self, camera_name: str, T_ee_to_robot: np.ndarray | None = None) -> np.ndarray:
         cam = self.cameras[camera_name]
         if cam.mount == CameraMount.EYE_TO_HAND:
-            if cam.T_robot_to_camera is None:
-                raise ValueError(f"Camera {camera_name!r} missing T_robot_to_camera.")
-            return transform_from_list(cam.T_robot_to_camera)
+            if cam.T_camera_to_robot is None:
+                raise ValueError(f"Camera {camera_name!r} missing T_camera_to_robot.")
+            return transform_from_list(cam.T_camera_to_robot)
         if cam.T_ee_to_camera is None:
             raise ValueError(f"Camera {camera_name!r} missing T_ee_to_camera.")
-        if T_robot_to_ee is None:
-            raise ValueError("eye_in_hand camera requires T_robot_to_ee at capture time.")
-        return T_robot_to_ee @ transform_from_list(cam.T_ee_to_camera)
+        if T_ee_to_robot is None:
+            raise ValueError("eye_in_hand camera requires T_ee_to_robot at capture time.")
+        # T_ee_to_camera: p_cam = T @ p_ee → camera→robot is G @ inv(T)
+        return T_ee_to_robot @ invert_transform(transform_from_list(cam.T_ee_to_camera))
 
-    def get_T_robot_to_table(self) -> np.ndarray:
+    def get_T_table_to_robot(self) -> np.ndarray:
         if self.table is None:
             raise ValueError("Table calibration missing.")
-        return transform_from_list(self.table.T_robot_to_table)
+        return transform_from_list(self.table.T_table_to_robot)
 
-    def export_summary(self, T_robot_to_ee: np.ndarray | None = None) -> dict[str, Any]:
-        """Flattened result: intrinsics, T_robot_to_camera, table grid."""
+    def export_summary(self, T_ee_to_robot: np.ndarray | None = None) -> dict[str, Any]:
+        """Flattened result: intrinsics, T_camera_to_robot, table grid."""
         data = self.to_dict()
         resolved: dict[str, list[list[float]]] = {}
         for name, cam in self.cameras.items():
             try:
-                resolved[name] = transform_to_list(self.get_T_robot_to_camera(name, T_robot_to_ee))
+                resolved[name] = transform_to_list(self.get_T_camera_to_robot(name, T_ee_to_robot))
             except ValueError:
                 continue
         if resolved:
-            data["T_robot_to_camera_resolved"] = resolved
+            data["T_camera_to_robot_resolved"] = resolved
         return data

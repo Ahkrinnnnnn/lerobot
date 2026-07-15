@@ -109,20 +109,17 @@ def transform_from_xyz_rpy_deg(
     pitch_deg: float,
     yaw_deg: float,
 ) -> np.ndarray:
-    """Build ``T`` from CRP-style pose ``[x, y, z, roll, pitch, yaw]`` (mm + degrees).
+    """Build ``T_ee_to_robot`` from CRP pose ``[x, y, z, roll, pitch, yaw]`` (mm + degrees).
 
-    Env:
-        CRP_POSE_INVERT=1 tests whether the CRP returned pose should be used as inverse(T).
+    CRP ``read_end_pose_world`` / ``read_end_pose_user`` match the teach pendant:
+    XYZ is the TCP origin in the chosen frame, RPY is TCP orientation. Composed as
+    ``T = [R(rpy) | xyz]`` (default extrinsic xyz RPY) this is the gripper→base
+    transform used by hand-eye (OpenCV ``gripper2base``).
     """
-    T = make_transform(
+    return make_transform(
         rotation_matrix_from_euler_xyz_deg(roll_deg, pitch_deg, yaw_deg),
         np.array([x, y, z], dtype=np.float64),
     )
-
-    if os.getenv("CRP_POSE_INVERT", "0").lower() in ("1", "true", "yes"):
-        T = invert_transform(T)
-
-    return T
 
 
 def invert_transform(transform: np.ndarray) -> np.ndarray:

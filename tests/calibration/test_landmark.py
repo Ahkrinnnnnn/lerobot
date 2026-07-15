@@ -19,8 +19,8 @@ from lerobot.calibration.board_config import CharucoBoardConfig
 from lerobot.calibration.charuco import CharucoConfig, charuco_corner_points_board_mm, table_grid_points_robot_mm
 from lerobot.calibration.landmark import (
     camera_extrinsic_from_landmark,
-    fuse_robot_to_landmark,
-    robot_to_landmark_from_eye_in_hand,
+    fuse_landmark_to_robot,
+    landmark_to_robot_from_eye_in_hand,
 )
 from lerobot.calibration.transforms import compose_transforms, invert_transform, make_transform
 
@@ -80,33 +80,34 @@ def test_table_grid_in_robot_frame():
     assert np.allclose(grid[1], [115.0, 200.0, 50.0])
 
 
-def test_robot_to_landmark_chain():
-    T_robot_to_ee = make_transform(np.eye(3), np.array([100.0, 0.0, 200.0]))
+def test_landmark_to_robot_chain():
+    T_ee_to_robot = make_transform(np.eye(3), np.array([100.0, 0.0, 200.0]))
     T_ee_to_cam = make_transform(np.eye(3), np.array([0.0, 0.0, 50.0]))
     T_landmark_to_cam = make_transform(np.eye(3), np.array([10.0, 20.0, 300.0]))
-    T = robot_to_landmark_from_eye_in_hand(T_robot_to_ee, T_ee_to_cam, T_landmark_to_cam)
+    T = landmark_to_robot_from_eye_in_hand(T_ee_to_robot, T_ee_to_cam, T_landmark_to_cam)
+    # T_board_to_robot = G @ inv(X) @ C
     expected = compose_transforms(
-        T_robot_to_ee,
-        compose_transforms(T_ee_to_cam, invert_transform(T_landmark_to_cam)),
+        T_ee_to_robot,
+        compose_transforms(invert_transform(T_ee_to_cam), T_landmark_to_cam),
     )
     assert np.allclose(T, expected)
-    assert np.allclose(T[:3, 3], [90.0, -20.0, -50.0])
+    assert np.allclose(T[:3, 3], [110.0, 20.0, 450.0])
 
 
 def test_camera_extrinsic_from_landmark():
-    T_robot_to_table = make_transform(np.eye(3), np.array([0.0, 0.0, 0.0]))
+    T_table_to_robot = make_transform(np.eye(3), np.array([0.0, 0.0, 0.0]))
     T_table_to_cam = make_transform(np.eye(3), np.array([0.0, 0.0, 500.0]))
-    T_robot_to_cam = camera_extrinsic_from_landmark(T_robot_to_table, T_table_to_cam)
-    assert np.allclose(T_robot_to_cam[:3, 3], [0.0, 0.0, -500.0])
+    T_camera_to_robot = camera_extrinsic_from_landmark(T_table_to_robot, T_table_to_cam)
+    assert np.allclose(T_camera_to_robot[:3, 3], [0.0, 0.0, -500.0])
 
 
-def test_fuse_robot_to_landmark():
+def test_fuse_landmark_to_robot():
     base = make_transform(np.eye(3), np.array([10.0, 20.0, 30.0]))
     noisy = [
         base,
         make_transform(np.eye(3), np.array([11.0, 19.0, 31.0])),
         make_transform(np.eye(3), np.array([9.0, 21.0, 29.0])),
     ]
-    fused, std = fuse_robot_to_landmark(noisy)
+    fused, std = fuse_landmark_to_robot(noisy)
     assert np.allclose(fused[:3, 3], [10.0, 20.0, 30.0], atol=1.0)
     assert std < 2.0

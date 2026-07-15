@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from .hand_eye import CameraMount, robot_to_board_from_eye_in_hand
+from .hand_eye import CameraMount, board_to_robot_from_eye_in_hand
 from .scene import SceneCalibration, TableCalibration
 from .target import CalibrationTargetConfig, grid_points_in_robot_frame
 from .transforms import average_rotation_matrices, compose_transforms, invert_transform, make_transform, transform_to_list
 
 
-def fuse_robot_to_landmark(transforms: list[np.ndarray]) -> tuple[np.ndarray, float]:
+def fuse_landmark_to_robot(transforms: list[np.ndarray]) -> tuple[np.ndarray, float]:
     if not transforms:
         raise ValueError("Need at least one transform to fuse.")
     translations = np.stack([t[:3, 3] for t in transforms], axis=0)
@@ -36,20 +36,21 @@ def fuse_robot_to_landmark(transforms: list[np.ndarray]) -> tuple[np.ndarray, fl
     return mean_transform, position_std
 
 
-def robot_to_landmark_from_eye_in_hand(
-    T_robot_to_ee: np.ndarray,
+def landmark_to_robot_from_eye_in_hand(
+    T_ee_to_robot: np.ndarray,
     T_ee_to_camera: np.ndarray,
     T_landmark_to_camera: np.ndarray,
 ) -> np.ndarray:
-    """Alias for :func:`robot_to_board_from_eye_in_hand` (landmark = fixed board)."""
-    return robot_to_board_from_eye_in_hand(T_robot_to_ee, T_ee_to_camera, T_landmark_to_camera)
+    """Alias for :func:`board_to_robot_from_eye_in_hand` (landmark = fixed board)."""
+    return board_to_robot_from_eye_in_hand(T_ee_to_robot, T_ee_to_camera, T_landmark_to_camera)
 
 
 def camera_extrinsic_from_landmark(
-    T_robot_to_landmark: np.ndarray,
+    T_board_to_robot: np.ndarray,
     T_landmark_to_camera: np.ndarray,
 ) -> np.ndarray:
-    return compose_transforms(T_robot_to_landmark, invert_transform(T_landmark_to_camera))
+    """``T_camera_to_robot``: ``p_robot = T_board_to_robot @ inv(T_landmark_to_camera) @ p_cam``."""
+    return compose_transforms(T_board_to_robot, invert_transform(T_landmark_to_camera))
 
 
 def get_eye_in_hand_extrinsic(scene: SceneCalibration, camera_name: str) -> np.ndarray:
@@ -77,7 +78,7 @@ def intrinsics_from_scene(scene: SceneCalibration, camera_name: str):
 
 
 def landmark_consistency_report(transforms: list[np.ndarray]) -> dict[str, float]:
-    _, std = fuse_robot_to_landmark(transforms)
+    _, std = fuse_landmark_to_robot(transforms)
     translations = np.stack([t[:3, 3] for t in transforms], axis=0)
     return {
         "num_samples": float(len(transforms)),
@@ -93,14 +94,14 @@ def landmark_consistency_report(transforms: list[np.ndarray]) -> dict[str, float
 
 def save_landmark_as_table(
     scene: SceneCalibration,
-    T_robot_to_landmark: np.ndarray,
+    T_landmark_to_robot: np.ndarray,
     target: CalibrationTargetConfig,
     notes: str,
 ) -> None:
     scene.charuco = target.to_dict()
-    grid = grid_points_in_robot_frame(T_robot_to_landmark, target)
+    grid = grid_points_in_robot_frame(T_landmark_to_robot, target)
     scene.table = TableCalibration(
-        T_robot_to_table=transform_to_list(T_robot_to_landmark),
+        T_table_to_robot=transform_to_list(T_landmark_to_robot),
         grid_points_robot_mm=grid,
         notes=notes,
     )

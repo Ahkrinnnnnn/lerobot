@@ -105,5 +105,5 @@ def draw_target(
     return vis, found
 
 
-def grid_points_in_robot_frame(T_robot_to_table: np.ndarray, target: CalibrationTargetConfig) -> list[list[float]]:
-    return table_grid_points_robot_mm(T_robot_to_table, target.charuco())
+def grid_points_in_robot_frame(T_table_to_robot: np.ndarray, target: CalibrationTargetConfig) -> list[list[float]]:
+    return table_grid_points_robot_mm(T_table_to_robot, target.charuco())

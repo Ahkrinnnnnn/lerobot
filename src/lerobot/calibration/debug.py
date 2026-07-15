@@ -97,7 +97,7 @@ def debug_print_capture(
     lines = [
         f"[debug] sample #{index:03d} pose_frame={robot_pose_frame.value}",
         f"        robot CRP {_fmt_pose_6d(pose_6d)}",
-        f"        robot T_robot_to_ee t(mm)={_fmt_t(cap.T_robot_to_ee)}",
+        f"        robot T_ee_to_robot t(mm)={_fmt_t(cap.T_ee_to_robot)}",
         f"        wrist corners={n_corners} sync={cap.total_sync_ms:.1f}ms"
         f" (wrist={cap.frame_read_ms:.1f} top={cap.top_frame_read_ms:.1f} pose={cap.pose_read_ms:.1f})",
     ]
@@ -165,7 +165,7 @@ def _fmt_rpy(R: np.ndarray) -> str:
 
 def _robot_world_delta_mm(samples: list[HandEyeSample], i: int) -> np.ndarray:
     """Naive world-frame translation change between consecutive robot poses."""
-    return samples[i].T_robot_to_ee[:3, 3] - samples[i - 1].T_robot_to_ee[:3, 3]
+    return samples[i].T_ee_to_robot[:3, 3] - samples[i - 1].T_ee_to_robot[:3, 3]
 
 
 def _vision_camera_t_delta_mm(samples: list[HandEyeSample], i: int) -> np.ndarray:
@@ -250,8 +250,9 @@ def debug_print_motion_pairs(samples: list[HandEyeSample], T_ee_to_camera: np.nd
         flush=True,
     )
     for i in range(1, len(samples)):
-        d_g = invert_transform(samples[i - 1].T_robot_to_ee) @ samples[i].T_robot_to_ee
-        d_t = invert_transform(samples[i - 1].T_target_to_camera) @ samples[i].T_target_to_camera
+        d_g = invert_transform(samples[i - 1].T_ee_to_robot) @ samples[i].T_ee_to_robot
+        # OpenCV B = C_{i-1} @ inv(C_i) with X = T_camera_to_ee
+        d_t = samples[i - 1].T_target_to_camera @ invert_transform(samples[i].T_target_to_camera)
         dt_robot_ee = d_g[:3, 3]
         dt_vision_board = d_t[:3, 3]
         dt_robot_world = _robot_world_delta_mm(samples, i)
@@ -260,8 +261,9 @@ def debug_print_motion_pairs(samples: list[HandEyeSample], T_ee_to_camera: np.nd
         t_t = float(np.linalg.norm(dt_vision_board))
         ang_g = _rotation_angle_deg(d_g[:3, :3])
         ang_t = _rotation_angle_deg(d_t[:3, :3])
-        lhs = d_g @ T_ee_to_camera
-        rhs = T_ee_to_camera @ d_t
+        X_cam_to_ee = invert_transform(T_ee_to_camera)
+        lhs = d_g @ X_cam_to_ee
+        rhs = X_cam_to_ee @ d_t
         dt_lhs = lhs[:3, 3]
         dt_rhs = rhs[:3, 3]
         dt_diff = dt_lhs - dt_rhs
@@ -275,7 +277,7 @@ def debug_print_motion_pairs(samples: list[HandEyeSample], T_ee_to_camera: np.nd
             flush=True,
         )
         print(
-            f"    vision |Δt|={t_t:.1f}mm  Δt_board(mm)={_fmt_vec3(dt_vision_board)}"
+            f"    vision |Δt|={t_t:.1f}mm  Δt_B(mm)={_fmt_vec3(dt_vision_board)}"
             f"  Δt_camera_naive(mm)={_fmt_vec3(dt_vision_cam_naive)}  ∠={ang_t:.1f}°",
             flush=True,
         )
@@ -310,7 +312,7 @@ def debug_print_translation_chain(
 
     print(
         "\n[debug] translation-chain check (board fixed on table → "
-        "T_robot_to_board should be constant):",
+        "T_board_to_robot should be constant):",
         flush=True,
     )
     print(
@@ -326,14 +328,15 @@ def debug_print_translation_chain(
     mixed: list[dict[str, float]] = []
 
     for i in range(1, len(samples)):
-        d_g = invert_transform(samples[i - 1].T_robot_to_ee) @ samples[i].T_robot_to_ee
-        d_t = invert_transform(samples[i - 1].T_target_to_camera) @ samples[i].T_target_to_camera
+        d_g = invert_transform(samples[i - 1].T_ee_to_robot) @ samples[i].T_ee_to_robot
+        d_t = samples[i - 1].T_target_to_camera @ invert_transform(samples[i].T_target_to_camera)
         ang_g = _rotation_angle_deg(d_g[:3, :3])
         ang_t = _rotation_angle_deg(d_t[:3, :3])
         dt_world = float(np.linalg.norm(_robot_world_delta_mm(samples, i)))
         board_step = float(np.linalg.norm(origins[i] - origins[i - 1]))
-        lhs = d_g @ T_ee_to_camera
-        rhs = T_ee_to_camera @ d_t
+        X_cam_to_ee = invert_transform(T_ee_to_camera)
+        lhs = d_g @ X_cam_to_ee
+        rhs = X_cam_to_ee @ d_t
         trans_axxb = float(np.linalg.norm(lhs[:3, 3] - rhs[:3, 3]))
         rot_axxb = float(np.linalg.norm(lhs[:3, :3] - rhs[:3, :3]))
         dev_i = float(np.linalg.norm(origins[i] - mean_o))
@@ -388,14 +391,15 @@ def debug_print_translation_chain(
             dxyz = np.linalg.norm(np.array(p1[:3]) - np.array(p0[:3]))
             if dxyz > 0.05:
                 continue
-            d_t = invert_transform(samples[i - 1].T_target_to_camera) @ samples[i].T_target_to_camera
+            d_t = samples[i - 1].T_target_to_camera @ invert_transform(samples[i].T_target_to_camera)
             ang_t = _rotation_angle_deg(d_t[:3, :3])
             if ang_t < 5:
                 continue
+            X_cam_to_ee = invert_transform(T_ee_to_camera)
             lhs = (
-                invert_transform(samples[i - 1].T_robot_to_ee) @ samples[i].T_robot_to_ee
-            ) @ T_ee_to_camera
-            rhs = T_ee_to_camera @ d_t
+                invert_transform(samples[i - 1].T_ee_to_robot) @ samples[i].T_ee_to_robot
+            ) @ X_cam_to_ee
+            rhs = X_cam_to_ee @ d_t
             trans_axxb = float(np.linalg.norm(lhs[:3, 3] - rhs[:3, 3]))
             print(
                 f"    {label(i - 1)}->{label(i)}: ∠vision={ang_t:.1f}° trans_axxb={trans_axxb:.1f}"
@@ -450,6 +454,12 @@ def debug_print_hand_eye_summary(
         flush=True,
     )
     print(f"        T_ee_to_camera t(mm)=({_fmt_t(T_ee_to_camera)})", flush=True)
+    cam_in_ee = -T_ee_to_camera[:3, :3].T @ T_ee_to_camera[:3, 3]
+    print(
+        f"        camera origin in EE (mm)=({cam_in_ee[0]:.1f},{cam_in_ee[1]:.1f},{cam_in_ee[2]:.1f})"
+        f"  ||={float(np.linalg.norm(cam_in_ee)):.1f}",
+        flush=True,
+    )
 
     for i, origin in enumerate(origins):
         dev = float(np.linalg.norm(origin - mean_o))

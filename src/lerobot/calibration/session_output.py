@@ -143,8 +143,8 @@ class CalibrationSessionOutput:
         }
         if capture.top_image is not None and self.images_top_dir is not None:
             meta["image_top"] = str((self.images_top_dir / f"{stem}.jpg").relative_to(self.root))
-        if capture.T_robot_to_ee is not None:
-            meta["T_robot_to_ee"] = capture.T_robot_to_ee.tolist()
+        if capture.T_ee_to_robot is not None:
+            meta["T_ee_to_robot"] = capture.T_ee_to_robot.tolist()
         if T_target_to_camera is not None:
             meta["T_target_to_camera"] = T_target_to_camera.tolist()
         return meta
@@ -162,8 +162,8 @@ class CalibrationSessionOutput:
             arrays[f"sync_ms_{i:03d}"] = np.array([cap.total_sync_ms], dtype=np.float64)
             if cap.top_image is not None:
                 arrays[f"image_top_{i:03d}"] = cap.top_image
-            if cap.T_robot_to_ee is not None:
-                arrays[f"T_robot_to_ee_{i:03d}"] = cap.T_robot_to_ee
+            if cap.T_ee_to_robot is not None:
+                arrays[f"T_ee_to_robot_{i:03d}"] = cap.T_ee_to_robot
         if samples is not None:
             for i, sample in enumerate(samples):
                 arrays[f"T_target_to_camera_{i:03d}"] = sample.T_target_to_camera

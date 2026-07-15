@@ -239,11 +239,11 @@ def charuco_corner_points_board_mm(config: CharucoConfig) -> list[np.ndarray]:
     ]
 
 
-def table_grid_points_robot_mm(T_robot_to_table: np.ndarray, config: CharucoConfig) -> list[list[float]]:
+def table_grid_points_robot_mm(T_table_to_robot: np.ndarray, config: CharucoConfig) -> list[list[float]]:
     """ChArUco inner corner grid in robot frame (mm)."""
     points: list[list[float]] = []
     for p in charuco_corner_points_board_mm(config):
         p_h = np.append(p, 1.0)
-        p_robot = (T_robot_to_table @ p_h)[:3]
+        p_robot = (T_table_to_robot @ p_h)[:3]
         points.append(p_robot.tolist())
     return points

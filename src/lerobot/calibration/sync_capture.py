@@ -40,7 +40,7 @@ class SyncCapture:
     """One save event: fresh image and (optionally) robot pose read back-to-back."""
 
     image: np.ndarray
-    T_robot_to_ee: np.ndarray | None
+    T_ee_to_robot: np.ndarray | None
     frame_read_ms: float
     pose_read_ms: float
     pose_after_frame_ms: float
@@ -82,18 +82,18 @@ def capture_frame_and_pose(
         t_top1 = time.perf_counter()
         top_ms = (t_top1 - t_top0) * 1e3
 
-    T_robot_to_ee = None
+    T_ee_to_robot = None
     pose_6d = None
     if record_pose:
         pose_6d = read_pose_6d_if_available(robot, robot_pose_frame)
         if pose_6d is not None:
-            T_robot_to_ee = transform_from_xyz_rpy_deg(*pose_6d)
+            T_ee_to_robot = transform_from_xyz_rpy_deg(*pose_6d)
         else:
-            T_robot_to_ee = robot.read_robot_to_ee(robot_pose_frame)
+            T_ee_to_robot = robot.read_ee_to_robot(robot_pose_frame)
     t2 = time.perf_counter()
     return SyncCapture(
         image=frame,
-        T_robot_to_ee=T_robot_to_ee,
+        T_ee_to_robot=T_ee_to_robot,
         frame_read_ms=(t1 - t0) * 1e3,
         pose_read_ms=(t2 - t1) * 1e3 if record_pose else 0.0,
         pose_after_frame_ms=(t2 - t1) * 1e3,

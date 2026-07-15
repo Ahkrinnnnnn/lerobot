@@ -34,8 +34,11 @@ class CameraMount(str, Enum):
 class HandEyeSample:
     """One synchronized robot pose + chessboard observation."""
 
-    T_robot_to_ee: np.ndarray
+    T_ee_to_robot: np.ndarray
+    """Gripper→base (OpenCV ``gripper2base``): ``p_robot = T @ p_ee``."""
+
     T_target_to_camera: np.ndarray
+    """Board→camera (OpenCV solvePnP): ``p_cam = T @ p_board``."""
 
 
 def solve_hand_eye(
@@ -46,36 +49,38 @@ def solve_hand_eye(
     """Solve for camera extrinsics.
 
     Returns:
-        * ``eye_in_hand``: ``T_ee_to_camera`` (4x4)
-        * ``eye_to_hand``: ``T_robot_to_camera`` (4x4), i.e. fixed camera in robot frame
+        * ``eye_in_hand``: ``T_ee_to_camera`` (4x4) with ``p_cam = T @ p_ee``
+        * ``eye_to_hand``: ``T_camera_to_robot`` (4x4) with ``p_robot = T @ p_cam``
+          (fixed camera; OpenCV ``cam2base``)
     """
     if len(samples) < 3:
         raise ValueError(f"Need >= 3 hand-eye samples, got {len(samples)}.")
 
     r_gripper2base: list[np.ndarray] = []
     t_gripper2base: list[np.ndarray] = []
-    r_cam2target: list[np.ndarray] = []
-    t_cam2target: list[np.ndarray] = []
+    r_target2cam: list[np.ndarray] = []
+    t_target2cam: list[np.ndarray] = []
 
     for sample in samples:
-        r_ee, t_ee = rotation_translation_from_transform(sample.T_robot_to_ee)
-        # OpenCV ``calibrateHandEye`` expects camera→target (inverse of solvePnP board→camera).
-        T_cam_to_target = invert_transform(sample.T_target_to_camera)
-        r_tgt, t_tgt = rotation_translation_from_transform(T_cam_to_target)
+        r_ee, t_ee = rotation_translation_from_transform(sample.T_ee_to_robot)
+        # OpenCV expects board→camera (solvePnP), NOT camera→board.
+        r_tgt, t_tgt = rotation_translation_from_transform(sample.T_target_to_camera)
         r_gripper2base.append(r_ee)
         t_gripper2base.append(t_ee.reshape(3, 1))
-        r_cam2target.append(r_tgt)
-        t_cam2target.append(t_tgt.reshape(3, 1))
+        r_target2cam.append(r_tgt)
+        t_target2cam.append(t_tgt.reshape(3, 1))
 
     if mount == CameraMount.EYE_IN_HAND:
         r_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
             r_gripper2base,
             t_gripper2base,
-            r_cam2target,
-            t_cam2target,
+            r_target2cam,
+            t_target2cam,
             method=method,
         )
-        return make_transform(r_cam2gripper, t_cam2gripper.reshape(3))
+        # OpenCV returns camera→gripper; we store gripper→camera.
+        T_camera_to_ee = make_transform(r_cam2gripper, t_cam2gripper.reshape(3))
+        return invert_transform(T_camera_to_ee)
 
     r_base2gripper: list[np.ndarray] = []
     t_base2gripper: list[np.ndarray] = []
@@ -88,34 +93,39 @@ def solve_hand_eye(
     r_cam2base, t_cam2base = cv2.calibrateHandEye(
         r_base2gripper,
         t_base2gripper,
-        r_cam2target,
-        t_cam2target,
+        r_target2cam,
+        t_target2cam,
         method=method,
     )
     return make_transform(r_cam2base, t_cam2base.reshape(3))
 
 
 def camera_to_robot_transform(
-    T_robot_to_ee: np.ndarray,
+    T_ee_to_robot: np.ndarray,
     T_ee_to_camera: np.ndarray,
 ) -> np.ndarray:
-    """Compose eye-in-hand extrinsics to ``T_robot_to_camera`` at a given pose."""
-    return T_robot_to_ee @ T_ee_to_camera
+    """``T_camera_to_robot`` with ``p_robot = T @ p_cam`` for eye-in-hand."""
+    return T_ee_to_robot @ invert_transform(T_ee_to_camera)
 
 
-def robot_to_board_from_eye_in_hand(
-    T_robot_to_ee: np.ndarray,
+def board_to_robot_from_eye_in_hand(
+    T_ee_to_robot: np.ndarray,
     T_ee_to_camera: np.ndarray,
     T_target_to_camera: np.ndarray,
 ) -> np.ndarray:
-    """Board pose in robot frame via three rigid transforms (eye-in-hand, fixed board).
+    """Board pose in robot frame (eye-in-hand, fixed board).
 
-    ``T_target_to_camera`` is OpenCV solvePnP output (board → camera). Chain:
+    Conventions (point maps)::
 
-        T_robot_to_board = T_robot_to_ee @ T_ee_to_camera @ inv(T_target_to_camera)
+        p_robot = T_ee_to_robot @ p_ee
+        p_cam   = T_ee_to_camera @ p_ee
+        p_cam   = T_target_to_camera @ p_board
+
+    therefore::
+
+        T_board_to_robot = T_ee_to_robot @ inv(T_ee_to_camera) @ T_target_to_camera
     """
-    T_camera_to_target = invert_transform(T_target_to_camera)
-    return T_robot_to_ee @ T_ee_to_camera @ T_camera_to_target
+    return T_ee_to_robot @ invert_transform(T_ee_to_camera) @ T_target_to_camera
 
 
 def per_sample_board_origin_mm(
@@ -127,14 +137,14 @@ def per_sample_board_origin_mm(
     origins: list[np.ndarray] = []
     for sample in samples:
         if mount == CameraMount.EYE_IN_HAND:
-            T_ref_to_target = robot_to_board_from_eye_in_hand(
-                sample.T_robot_to_ee, T_solved, sample.T_target_to_camera
+            T_ref_to_target = board_to_robot_from_eye_in_hand(
+                sample.T_ee_to_robot, T_solved, sample.T_target_to_camera
             )
         else:
-            T_cam_to_target = invert_transform(sample.T_target_to_camera)
-            T_robot_to_cam = T_solved
-            T_robot_to_target = T_robot_to_cam @ T_cam_to_target
-            T_ref_to_target = invert_transform(sample.T_robot_to_ee) @ T_robot_to_target
+            # T_solved = T_camera_to_robot with p_robot = T @ p_cam
+            T_target_to_robot = T_solved @ sample.T_target_to_camera
+            # Board fixed on gripper → report in ee frame
+            T_ref_to_target = invert_transform(sample.T_ee_to_robot) @ T_target_to_robot
         origins.append(T_ref_to_target[:3, 3])
     return np.stack(origins, axis=0)
 
@@ -143,15 +153,23 @@ def hand_eye_motion_residual_mm(
     samples: list[HandEyeSample],
     T_ee_to_camera: np.ndarray,
 ) -> dict[str, float]:
-    """Mean/max AX=XB residual (mm) for consecutive sample pairs."""
+    """Mean/max AX=XB residual (mm) for consecutive sample pairs.
+
+    OpenCV eye-in-hand uses ``X = T_camera_to_ee = inv(T_ee_to_camera)`` with::
+
+        A = inv(G_{i-1}) @ G_i
+        B = C_{i-1} @ inv(C_i)
+        A X = X B
+    """
     if len(samples) < 2:
         return {"mean_mm": 0.0, "max_mm": 0.0}
+    X_cam_to_ee = invert_transform(T_ee_to_camera)
     residuals: list[float] = []
     for i in range(1, len(samples)):
-        d_gripper = invert_transform(samples[i - 1].T_robot_to_ee) @ samples[i].T_robot_to_ee
-        d_target = invert_transform(samples[i - 1].T_target_to_camera) @ samples[i].T_target_to_camera
-        lhs = d_gripper @ T_ee_to_camera
-        rhs = T_ee_to_camera @ d_target
+        d_gripper = invert_transform(samples[i - 1].T_ee_to_robot) @ samples[i].T_ee_to_robot
+        d_target = samples[i - 1].T_target_to_camera @ invert_transform(samples[i].T_target_to_camera)
+        lhs = d_gripper @ X_cam_to_ee
+        rhs = X_cam_to_ee @ d_target
         rot_err = np.linalg.norm(lhs[:3, :3] - rhs[:3, :3])
         trans_err = np.linalg.norm(lhs[:3, 3] - rhs[:3, 3])
         residuals.append(float(rot_err + trans_err))
@@ -165,8 +183,8 @@ def hand_eye_target_origin_std(
 ) -> float:
     """Std-dev of chessboard origin in the reference frame (lower is better).
 
-    * eye-in-hand: board fixed in robot frame → ``T_robot_to_target`` should be constant
-    * eye-to-hand: board on gripper → ``T_ee_to_target`` should be constant
+    * eye-in-hand: board fixed in robot frame → ``T_board_to_robot`` should be constant
+    * eye-to-hand: board on gripper → board pose in ee frame should be constant
     """
     stacked = per_sample_board_origin_mm(samples, mount, T_solved)
     return float(np.linalg.norm(np.std(stacked, axis=0)))

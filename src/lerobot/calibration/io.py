@@ -33,7 +33,7 @@ def _str_array(value: str) -> np.ndarray:
     return np.array(value, dtype=object)
 
 
-def scene_to_npz_arrays(scene: SceneCalibration, T_robot_to_ee: np.ndarray | None = None) -> dict[str, np.ndarray]:
+def scene_to_npz_arrays(scene: SceneCalibration, T_ee_to_robot: np.ndarray | None = None) -> dict[str, np.ndarray]:
     arrays: dict[str, np.ndarray] = {
         "version": np.array([scene.version], dtype=np.int32),
         "robot_type": _str_array(scene.robot_type),
@@ -60,18 +60,18 @@ def scene_to_npz_arrays(scene: SceneCalibration, T_robot_to_ee: np.ndarray | Non
         arrays[f"{prefix}mount"] = _str_array(cam.mount.value)
         if cam.reprojection_error is not None:
             arrays[f"{prefix}reprojection_error"] = np.array([cam.reprojection_error], dtype=np.float64)
-        if cam.T_robot_to_camera is not None:
-            arrays[f"{prefix}T_robot_to_camera"] = np.asarray(cam.T_robot_to_camera, dtype=np.float64)
+        if cam.T_camera_to_robot is not None:
+            arrays[f"{prefix}T_camera_to_robot"] = np.asarray(cam.T_camera_to_robot, dtype=np.float64)
         if cam.T_ee_to_camera is not None:
             arrays[f"{prefix}T_ee_to_camera"] = np.asarray(cam.T_ee_to_camera, dtype=np.float64)
         try:
-            T_resolved = scene.get_T_robot_to_camera(name, T_robot_to_ee)
-            arrays[f"{prefix}T_robot_to_camera_resolved"] = T_resolved
+            T_resolved = scene.get_T_camera_to_robot(name, T_ee_to_robot)
+            arrays[f"{prefix}T_camera_to_robot_resolved"] = T_resolved
         except ValueError:
             pass
 
     if scene.table is not None:
-        arrays["T_robot_to_table"] = np.asarray(scene.table.T_robot_to_table, dtype=np.float64)
+        arrays["T_table_to_robot"] = np.asarray(scene.table.T_table_to_robot, dtype=np.float64)
         if scene.table.grid_points_robot_mm:
             arrays["table_grid_points_robot_mm"] = np.asarray(scene.table.grid_points_robot_mm, dtype=np.float64)
         if scene.table.notes:
@@ -82,6 +82,13 @@ def scene_to_npz_arrays(scene: SceneCalibration, T_robot_to_ee: np.ndarray | Non
 
 def scene_from_npz_arrays(arrays: dict[str, np.ndarray]) -> SceneCalibration:
     from .hand_eye import CameraMount
+
+    def _pick(prefix: str, *keys: str) -> np.ndarray | None:
+        for key in keys:
+            full = f"{prefix}{key}" if prefix else key
+            if full in arrays:
+                return arrays[full]
+        return None
 
     camera_names = str(arrays["camera_names"].item()).split(",") if arrays["camera_names"].item() else []
     cameras = {}
@@ -98,8 +105,10 @@ def scene_from_npz_arrays(arrays: dict[str, np.ndarray]) -> SceneCalibration:
         }
         if f"{prefix}reprojection_error" in arrays:
             cam_data["reprojection_error"] = float(arrays[f"{prefix}reprojection_error"][0])
-        if f"{prefix}T_robot_to_camera" in arrays:
-            cam_data["T_robot_to_camera"] = arrays[f"{prefix}T_robot_to_camera"].tolist()
+        # Prefer new keys; fall back to pre-rename NPZ names.
+        T_cam = _pick(prefix, "T_camera_to_robot", "T_robot_to_camera")
+        if T_cam is not None:
+            cam_data["T_camera_to_robot"] = T_cam.tolist()
         if f"{prefix}T_ee_to_camera" in arrays:
             cam_data["T_ee_to_camera"] = arrays[f"{prefix}T_ee_to_camera"].tolist()
         cameras[name] = cam_data
@@ -113,7 +122,7 @@ def scene_from_npz_arrays(arrays: dict[str, np.ndarray]) -> SceneCalibration:
         "angle_unit": str(arrays["angle_unit"].item()),
         "intrinsics": {},
         "camera_mounts": {},
-        "T_robot_to_camera": {},
+        "T_camera_to_robot": {},
         "T_ee_to_camera": {},
     }
     for name, cam in cameras.items():
@@ -125,8 +134,8 @@ def scene_from_npz_arrays(arrays: dict[str, np.ndarray]) -> SceneCalibration:
             "dist_coeffs": cam["dist_coeffs"],
             "reprojection_error": cam.get("reprojection_error"),
         }
-        if "T_robot_to_camera" in cam:
-            data["T_robot_to_camera"][name] = cam["T_robot_to_camera"]
+        if "T_camera_to_robot" in cam:
+            data["T_camera_to_robot"][name] = cam["T_camera_to_robot"]
         if "T_ee_to_camera" in cam:
             data["T_ee_to_camera"][name] = cam["T_ee_to_camera"]
 
@@ -140,8 +149,13 @@ def scene_from_npz_arrays(arrays: dict[str, np.ndarray]) -> SceneCalibration:
     if charuco:
         data["charuco"] = charuco
 
-    if "T_robot_to_table" in arrays:
-        data["T_robot_to_table"] = arrays["T_robot_to_table"].tolist()
+    T_table = None
+    if "T_table_to_robot" in arrays:
+        T_table = arrays["T_table_to_robot"]
+    elif "T_robot_to_table" in arrays:
+        T_table = arrays["T_robot_to_table"]
+    if T_table is not None:
+        data["T_table_to_robot"] = T_table.tolist()
         if "table_grid_points_robot_mm" in arrays:
             data["table_grid_points_robot_mm"] = arrays["table_grid_points_robot_mm"].tolist()
         if "table_notes" in arrays:
@@ -164,13 +178,13 @@ def save_scene_calibration(
     calibration: SceneCalibration,
     path: Path | str,
     *,
-    T_robot_to_ee: np.ndarray | None = None,
+    T_ee_to_robot: np.ndarray | None = None,
 ) -> Path:
     path = Path(path)
     if path.suffix != ".npz":
         path = path.with_suffix(".npz")
     path.parent.mkdir(parents=True, exist_ok=True)
-    arrays = scene_to_npz_arrays(calibration, T_robot_to_ee)
+    arrays = scene_to_npz_arrays(calibration, T_ee_to_robot)
     np.savez(path, **arrays)
     return path
 

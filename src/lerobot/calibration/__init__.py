@@ -20,7 +20,7 @@ from .hand_eye import (
     CameraMount,
     HandEyeSample,
     hand_eye_target_origin_std,
-    robot_to_board_from_eye_in_hand,
+    board_to_robot_from_eye_in_hand,
     solve_hand_eye,
 )
 from .io import (
@@ -30,7 +30,7 @@ from .io import (
     load_scene_calibration,
     save_scene_calibration,
 )
-from .landmark import camera_extrinsic_from_landmark, fuse_robot_to_landmark, robot_to_landmark_from_eye_in_hand
+from .landmark import camera_extrinsic_from_landmark, fuse_landmark_to_robot, landmark_to_robot_from_eye_in_hand
 from .runner import (
     CalibrationRunConfig,
     print_methods_help,
@@ -65,15 +65,15 @@ __all__ = [
     "compose_transforms",
     "default_scene_calibration_path",
     "describe_npz",
-    "fuse_robot_to_landmark",
+    "fuse_landmark_to_robot",
     "hand_eye_target_origin_std",
     "invert_transform",
     "load_or_create_scene_calibration",
     "load_scene_calibration",
     "make_transform",
     "print_methods_help",
-    "robot_to_board_from_eye_in_hand",
-    "robot_to_landmark_from_eye_in_hand",
+    "board_to_robot_from_eye_in_hand",
+    "landmark_to_robot_from_eye_in_hand",
     "run_camera_via_landmark_calibration",
     "run_hand_eye_calibration",
     "run_intrinsics_calibration",

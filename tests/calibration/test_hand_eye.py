@@ -18,10 +18,10 @@ from lerobot.calibration.hand_eye import (
     CameraMount,
     HandEyeSample,
     per_sample_board_origin_mm,
-    robot_to_board_from_eye_in_hand,
+    board_to_robot_from_eye_in_hand,
     solve_hand_eye,
 )
-from lerobot.calibration.landmark import robot_to_landmark_from_eye_in_hand
+from lerobot.calibration.landmark import landmark_to_robot_from_eye_in_hand
 from lerobot.calibration.transforms import compose_transforms, invert_transform, make_transform
 
 
@@ -36,6 +36,7 @@ def _random_rotation(rng: np.random.Generator) -> np.ndarray:
 
 
 def _synthesize_eye_in_hand_samples(n: int, seed: int = 0) -> tuple[np.ndarray, list[HandEyeSample]]:
+    """Geometric synthesis: p_cam = T_ee_to_cam @ p_ee, p_cam = C @ p_board."""
     rng = np.random.default_rng(seed)
     t_ee_to_cam = make_transform(_random_rotation(rng), rng.normal(size=3) * 50)
     t_robot_to_target = make_transform(_random_rotation(rng), rng.uniform(-200, 200, size=3))
@@ -43,10 +44,12 @@ def _synthesize_eye_in_hand_samples(n: int, seed: int = 0) -> tuple[np.ndarray, 
     samples: list[HandEyeSample] = []
     for _ in range(n):
         t_robot_to_ee = make_transform(_random_rotation(rng), rng.uniform(-400, 400, size=3))
-        t_robot_to_cam = compose_transforms(t_robot_to_ee, t_ee_to_cam)
-        t_cam_to_target = compose_transforms(invert_transform(t_robot_to_cam), t_robot_to_target)
-        t_target_to_cam = invert_transform(t_cam_to_target)
-        samples.append(HandEyeSample(T_robot_to_ee=t_robot_to_ee, T_target_to_camera=t_target_to_cam))
+        # C = T_ee_to_cam @ inv(G) @ T_board_to_robot
+        t_target_to_cam = compose_transforms(
+            t_ee_to_cam,
+            compose_transforms(invert_transform(t_robot_to_ee), t_robot_to_target),
+        )
+        samples.append(HandEyeSample(T_ee_to_robot=t_robot_to_ee, T_target_to_camera=t_target_to_cam))
     return t_ee_to_cam, samples
 
 
@@ -56,17 +59,17 @@ def test_solve_eye_in_hand_recovers_extrinsics():
     assert np.allclose(gt, est, atol=1e-2)
 
 
-def test_robot_to_board_three_transform_chain():
+def test_board_to_robot_three_transform_chain():
     gt, samples = _synthesize_eye_in_hand_samples(8, seed=1)
-    t_robot_to_target = robot_to_board_from_eye_in_hand(
-        samples[0].T_robot_to_ee, gt, samples[0].T_target_to_camera
+    t_robot_to_target = board_to_robot_from_eye_in_hand(
+        samples[0].T_ee_to_robot, gt, samples[0].T_target_to_camera
     )
     for sample in samples:
-        via_helper = robot_to_board_from_eye_in_hand(
-            sample.T_robot_to_ee, gt, sample.T_target_to_camera
+        via_helper = board_to_robot_from_eye_in_hand(
+            sample.T_ee_to_robot, gt, sample.T_target_to_camera
         )
-        via_landmark = robot_to_landmark_from_eye_in_hand(
-            sample.T_robot_to_ee, gt, sample.T_target_to_camera
+        via_landmark = landmark_to_robot_from_eye_in_hand(
+            sample.T_ee_to_robot, gt, sample.T_target_to_camera
         )
         assert np.allclose(via_helper, via_landmark)
         assert np.allclose(via_helper, t_robot_to_target, atol=1e-6)
@@ -97,11 +100,11 @@ def test_scene_npz_roundtrip(tmp_path):
                 height=480,
                 camera_matrix=[[500, 0, 320], [0, 500, 240], [0, 0, 1]],
                 dist_coeffs=[0.0, 0.0, 0.0, 0.0, 0.0],
-                T_robot_to_camera=np.eye(4).tolist(),
+                T_camera_to_robot=np.eye(4).tolist(),
             )
         },
         table=TableCalibration(
-            T_robot_to_table=np.eye(4).tolist(),
+            T_table_to_robot=np.eye(4).tolist(),
             grid_points_robot_mm=[[0.0, 0.0, 0.0], [15.0, 0.0, 0.0]],
         ),
     )

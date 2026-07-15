@@ -45,11 +45,11 @@ from .experiment_paths import (
 from .io import default_scene_calibration_path, load_or_create_scene_calibration, save_scene_calibration
 from .landmark import (
     camera_extrinsic_from_landmark,
-    fuse_robot_to_landmark,
+    fuse_landmark_to_robot,
     get_eye_in_hand_extrinsic,
     intrinsics_from_scene,
     landmark_consistency_report,
-    robot_to_landmark_from_eye_in_hand,
+    landmark_to_robot_from_eye_in_hand,
     save_landmark_as_table,
 )
 from .scene import (
@@ -237,6 +237,7 @@ def _hand_eye_sample_diagnostics(
     return {
         "board_origin_mean_mm": mean_origin.tolist(),
         "board_origin_spread_mm": (origins.max(axis=0) - origins.min(axis=0)).tolist(),
+        "camera_origin_in_ee_mm": (-T_ee_to_camera[:3, :3].T @ T_ee_to_camera[:3, 3]).tolist(),
         "hand_eye_motion_residual_mm": motion,
         "per_sample": per_sample,
         "likely_causes_if_high_std": [
@@ -255,7 +256,7 @@ def _solve_top_extrinsic_via_board(
     top_intrinsics: CameraIntrinsics,
     target: CalibrationTargetConfig,
 ) -> tuple[np.ndarray, float, list[np.ndarray], list[dict[str, Any]]]:
-    """Fuse ``T_robot_to_top`` from wrist board chain + top PnP per snapshot."""
+    """Fuse ``T_top_to_robot`` from wrist board chain + top PnP per snapshot."""
     transforms: list[np.ndarray] = []
     board_transforms: list[np.ndarray] = []
     diags: list[dict[str, Any]] = []
@@ -265,22 +266,22 @@ def _solve_top_extrinsic_via_board(
         T_board_to_top = estimate_target_to_camera(cap.top_image, top_intrinsics, target)
         if T_board_to_top is None:
             continue
-        T_robot_to_board = robot_to_landmark_from_eye_in_hand(
-            sample.T_robot_to_ee, T_ee_to_wrist, sample.T_target_to_camera
+        T_board_to_robot = landmark_to_robot_from_eye_in_hand(
+            sample.T_ee_to_robot, T_ee_to_wrist, sample.T_target_to_camera
         )
-        T_robot_to_top = camera_extrinsic_from_landmark(T_robot_to_board, T_board_to_top)
-        transforms.append(T_robot_to_top)
-        board_transforms.append(T_robot_to_board)
+        T_top_to_robot = camera_extrinsic_from_landmark(T_board_to_robot, T_board_to_top)
+        transforms.append(T_top_to_robot)
+        board_transforms.append(T_board_to_robot)
         diags.append(
             {
                 "index": i,
-                "T_robot_to_top_translation_mm": T_robot_to_top[:3, 3].tolist(),
-                "T_robot_to_board_translation_mm": T_robot_to_board[:3, 3].tolist(),
+                "T_top_to_robot_translation_mm": T_top_to_robot[:3, 3].tolist(),
+                "T_board_to_robot_translation_mm": T_board_to_robot[:3, 3].tolist(),
             }
         )
     if not transforms:
         raise RuntimeError("No valid dual-camera samples (top must see ChArUco in each saved frame).")
-    T_top, std_mm = fuse_robot_to_landmark(transforms)
+    T_top, std_mm = fuse_landmark_to_robot(transforms)
     return T_top, std_mm, board_transforms, diags
 
 
@@ -308,7 +309,7 @@ def _load_or_calibrate_top_intrinsics(
     cam_calib = _intrinsics_to_camera_calib(intrinsics, CameraMount.EYE_TO_HAND)
     prev = scene.cameras.get(cfg.top_camera)
     if prev is not None:
-        cam_calib.T_robot_to_camera = prev.T_robot_to_camera
+        cam_calib.T_camera_to_robot = prev.T_camera_to_robot
     scene.cameras[cfg.top_camera] = cam_calib
     save_scene_calibration(scene, _resolve_output_path(robot, cfg))
     _persist_canonical_intrinsics(cfg, cfg.top_camera, intrinsics, phase="top_from_dual_capture")
@@ -397,7 +398,7 @@ def run_intrinsics_calibration(
     cam_calib = _intrinsics_to_camera_calib(intrinsics, mount)
     prev = scene.cameras.get(camera_name)
     if prev is not None:
-        cam_calib.T_robot_to_camera = prev.T_robot_to_camera
+        cam_calib.T_camera_to_robot = prev.T_camera_to_robot
         cam_calib.T_ee_to_camera = prev.T_ee_to_camera
     scene.cameras[camera_name] = cam_calib
 
@@ -528,7 +529,7 @@ def collect_wrist_sync_captures(
         f"q works only after >= {min_samples} saves.",
     ]
     if top_camera is not None:
-        setup_lines.append(f"Also captures {top_camera!r} each save → T_robot_to_top via static board.")
+        setup_lines.append(f"Also captures {top_camera!r} each save → T_top_to_robot via static board.")
     if cfg.debug:
         if scene_intrinsics is not None:
             rms = scene_intrinsics.reprojection_error
@@ -689,7 +690,7 @@ def run_intrinsics_and_hand_eye_calibration(
             if T_target_to_cam is None:
                 raise RuntimeError(f"PnP failed on saved sample {i} after intrinsics calibration.")
             samples.append(
-                HandEyeSample(T_robot_to_ee=cap.T_robot_to_ee, T_target_to_camera=T_target_to_cam)
+                HandEyeSample(T_ee_to_robot=cap.T_ee_to_robot, T_target_to_camera=T_target_to_cam)
             )
             session.save_capture(
                 i, cap, cfg.target, intrinsics=intrinsics, T_target_to_camera=T_target_to_cam
@@ -720,7 +721,7 @@ def run_intrinsics_and_hand_eye_calibration(
         scene = _load_scene(robot, cfg)
         cam_calib = _intrinsics_to_camera_calib(intrinsics, mount)
         cam_calib.T_ee_to_camera = transform_to_list(T_solved)
-        cam_calib.T_robot_to_camera = None
+        cam_calib.T_camera_to_robot = None
         scene.cameras[camera_name] = cam_calib
 
         report: dict[str, Any] = {
@@ -751,17 +752,17 @@ def run_intrinsics_and_hand_eye_calibration(
         if top_camera is not None:
             top_images = [cap.top_image for cap in captures if cap.top_image is not None]
             top_intrinsics = _load_or_calibrate_top_intrinsics(robot, cfg, top_images)
-            T_robot_to_top, top_std_mm, board_transforms, top_diags = _solve_top_extrinsic_via_board(
+            T_top_to_robot, top_std_mm, board_transforms, top_diags = _solve_top_extrinsic_via_board(
                 captures,
                 samples,
                 T_solved,
                 top_intrinsics,
                 cfg.target,
             )
-            T_robot_to_board, board_std_mm = fuse_robot_to_landmark(board_transforms)
+            T_board_to_robot, board_std_mm = fuse_landmark_to_robot(board_transforms)
             save_landmark_as_table(
                 scene,
-                T_robot_to_board,
+                T_board_to_robot,
                 cfg.target,
                 notes=f"{len(board_transforms)} dual-camera snapshots, board_std={board_std_mm:.2f}mm",
             )
@@ -769,18 +770,18 @@ def run_intrinsics_and_hand_eye_calibration(
                 top_intrinsics, CameraMount.EYE_TO_HAND
             )
             top_calib.mount = CameraMount.EYE_TO_HAND
-            top_calib.T_robot_to_camera = transform_to_list(T_robot_to_top)
+            top_calib.T_camera_to_robot = transform_to_list(T_top_to_robot)
             top_calib.T_ee_to_camera = None
             scene.cameras[top_camera] = top_calib
             report["top_camera"] = top_camera
             report["top_extrinsic_std_mm"] = top_std_mm
-            report["top_T_robot_to_camera"] = T_robot_to_top.tolist()
-            report["T_robot_to_board"] = T_robot_to_board.tolist()
+            report["top_T_camera_to_robot"] = T_top_to_robot.tolist()
+            report["T_board_to_robot"] = T_board_to_robot.tolist()
             report["board_fusion_std_mm"] = board_std_mm
             report["top_dual_camera_samples"] = top_diags
             if cfg.debug:
                 print(
-                    f"[debug] top T_robot_to_camera fusion std={top_std_mm:.2f}mm"
+                    f"[debug] top T_camera_to_robot fusion std={top_std_mm:.2f}mm"
                     f" board_via_wrist std={board_std_mm:.2f}mm ({len(top_diags)} views)",
                     flush=True,
                 )
@@ -891,7 +892,7 @@ def collect_hand_eye_samples(
             if T_target_to_cam is None:
                 return False
             samples.append(
-                HandEyeSample(T_robot_to_ee=cap.T_robot_to_ee, T_target_to_camera=T_target_to_cam)
+                HandEyeSample(T_ee_to_robot=cap.T_ee_to_robot, T_target_to_camera=T_target_to_cam)
             )
             idx = len(samples) - 1
             session.save_capture(
@@ -1057,9 +1058,9 @@ def run_hand_eye_calibration(
 
         if mount == CameraMount.EYE_IN_HAND:
             cam_calib.T_ee_to_camera = transform_to_list(T_solved)
-            cam_calib.T_robot_to_camera = None
+            cam_calib.T_camera_to_robot = None
         else:
-            cam_calib.T_robot_to_camera = transform_to_list(T_solved)
+            cam_calib.T_camera_to_robot = transform_to_list(T_solved)
             cam_calib.T_ee_to_camera = None
 
         scene.cameras[camera_name] = cam_calib
@@ -1092,7 +1093,7 @@ def collect_landmark_transforms(
     min_samples: int,
     stop_key: str = "q",
 ) -> list[np.ndarray]:
-    """Multi-view wrist (eye-in-hand) observations of a fixed table ChArUco → T_robot_to_landmark."""
+    """Multi-view wrist (eye-in-hand) observations of a fixed table ChArUco → T_landmark_to_robot."""
     scene = _load_scene(robot, cfg)
     if camera_name not in scene.cameras:
         raise RuntimeError(f"Run intrinsics for {camera_name!r} first.")
@@ -1121,10 +1122,10 @@ def collect_landmark_transforms(
             T_landmark_to_camera = estimate_target_to_camera(cap.image, intrinsics, cfg.target)
             if T_landmark_to_camera is None:
                 return False
-            T_robot_to_landmark = robot_to_landmark_from_eye_in_hand(
-                cap.T_robot_to_ee, T_ee_to_camera, T_landmark_to_camera
+            T_landmark_to_robot = landmark_to_robot_from_eye_in_hand(
+                cap.T_ee_to_robot, T_ee_to_camera, T_landmark_to_camera
             )
-            transforms.append(T_robot_to_landmark)
+            transforms.append(T_landmark_to_robot)
             session.save_capture(
                 len(transforms) - 1,
                 cap,
@@ -1177,7 +1178,7 @@ def run_landmark_map_calibration(
         transforms = collect_landmark_transforms(
             robot, camera_name, cfg, min_samples=cfg.min_landmark_samples
         )
-    T_fused, std_mm = fuse_robot_to_landmark(transforms)
+    T_fused, std_mm = fuse_landmark_to_robot(transforms)
     report = landmark_consistency_report(transforms)
     scene = _load_scene(robot, cfg)
     save_landmark_as_table(
@@ -1300,7 +1301,7 @@ def run_top_extrinsic_dual_calibration(
     mount: CameraMount,
     cfg: CalibrationRunConfig,
 ) -> np.ndarray:
-    """Infer ``T_robot_to_top`` from wrist hand-eye chain + top PnP (handheld board)."""
+    """Infer ``T_top_to_robot`` from wrist hand-eye chain + top PnP (handheld board)."""
     if mount != CameraMount.EYE_TO_HAND:
         raise ValueError("top_extrinsic_dual expects eye_to_hand fixed camera.")
 
@@ -1349,10 +1350,10 @@ def run_top_extrinsic_dual_calibration(
             T_target_to_cam = estimate_target_to_camera(cap.image, wrist_intrinsics, cfg.target)
             if T_target_to_cam is None:
                 raise RuntimeError(f"PnP failed on wrist sample {i}.")
-            if cap.T_robot_to_ee is None:
+            if cap.T_ee_to_robot is None:
                 raise RuntimeError(f"Missing robot pose on sample {i}.")
             samples.append(
-                HandEyeSample(T_robot_to_ee=cap.T_robot_to_ee, T_target_to_camera=T_target_to_cam)
+                HandEyeSample(T_ee_to_robot=cap.T_ee_to_robot, T_target_to_camera=T_target_to_cam)
             )
             session.save_capture(
                 i,
@@ -1362,7 +1363,7 @@ def run_top_extrinsic_dual_calibration(
                 T_target_to_camera=T_target_to_cam,
             )
 
-        T_robot_to_top, std_mm, board_transforms, top_diags = _solve_top_extrinsic_via_board(
+        T_top_to_robot, std_mm, board_transforms, top_diags = _solve_top_extrinsic_via_board(
             captures,
             samples,
             T_ee_to_wrist,
@@ -1376,7 +1377,7 @@ def run_top_extrinsic_dual_calibration(
             )
         top_calib = scene.cameras[top_camera_name]
         top_calib.mount = CameraMount.EYE_TO_HAND
-        top_calib.T_robot_to_camera = transform_to_list(T_robot_to_top)
+        top_calib.T_camera_to_robot = transform_to_list(T_top_to_robot)
         top_calib.T_ee_to_camera = None
         scene.cameras[top_camera_name] = top_calib
 
@@ -1388,12 +1389,12 @@ def run_top_extrinsic_dual_calibration(
             "mount": mount.value,
             "num_samples": len(samples),
             "top_extrinsic_std_mm": std_mm,
-            "T_robot_to_camera": T_robot_to_top.tolist(),
+            "T_camera_to_robot": T_top_to_robot.tolist(),
             "dual_camera_samples": top_diags,
             "npz_output": str(out),
             "log_file": session.log_path.name,
             "note": (
-                "T_robot_to_top fused from wrist board chain + top PnP per save. "
+                "T_top_to_robot fused from wrist board chain + top PnP per save. "
                 "Board may be handheld; does not require landmark_map."
             ),
         }
@@ -1413,7 +1414,7 @@ def run_top_extrinsic_dual_calibration(
             len(board_transforms),
         )
         logger.info("Session artifacts → %s", session.root)
-        return T_robot_to_top
+        return T_top_to_robot
     finally:
         session.end_log()
 
@@ -1426,13 +1427,13 @@ def collect_camera_via_landmark_transforms(
     min_samples: int = 1,
     stop_key: str = "q",
 ) -> list[np.ndarray]:
-    """Fixed camera sees the same table ChArUco; infer T_robot_to_camera from saved table map."""
+    """Fixed camera sees the same table ChArUco; infer T_camera_to_robot from saved table map."""
     scene = _load_scene(robot, cfg)
     if scene.table is None:
-        raise RuntimeError("Run landmark_map first to define T_robot_to_table.")
+        raise RuntimeError("Run landmark_map first to define T_table_to_robot.")
     if camera_name not in scene.cameras:
         raise RuntimeError(f"Run intrinsics for {camera_name!r} first.")
-    T_robot_to_table = np.array(scene.table.T_robot_to_table, dtype=np.float64)
+    T_table_to_robot = np.array(scene.table.T_table_to_robot, dtype=np.float64)
     intrinsics = intrinsics_from_scene(scene, camera_name)
     transforms: list[np.ndarray] = []
     session = _open_session(robot, cfg, "camera_via_landmark", camera_name)
@@ -1459,8 +1460,8 @@ def collect_camera_via_landmark_transforms(
             T_landmark_to_camera = estimate_target_to_camera(cap.image, intrinsics, cfg.target)
             if T_landmark_to_camera is None:
                 return False
-            T_robot_to_camera = camera_extrinsic_from_landmark(T_robot_to_table, T_landmark_to_camera)
-            transforms.append(T_robot_to_camera)
+            T_camera_to_robot = camera_extrinsic_from_landmark(T_table_to_robot, T_landmark_to_camera)
+            transforms.append(T_camera_to_robot)
             session.save_capture(
                 len(transforms) - 1,
                 cap,
@@ -1513,14 +1514,14 @@ def run_camera_via_landmark_calibration(
     if transforms is None:
         transforms = collect_camera_via_landmark_transforms(robot, camera_name, cfg, min_samples=1)
 
-    T_fused, std_mm = fuse_robot_to_landmark(transforms)
+    T_fused, std_mm = fuse_landmark_to_robot(transforms)
     scene = _load_scene(robot, cfg)
     if camera_name not in scene.cameras:
         raise RuntimeError(f"Run intrinsics for {camera_name!r} first.")
     cam_calib = scene.cameras[camera_name]
     cam_calib.mount = mount
     if mount == CameraMount.EYE_TO_HAND:
-        cam_calib.T_robot_to_camera = transform_to_list(T_fused)
+        cam_calib.T_camera_to_robot = transform_to_list(T_fused)
         cam_calib.T_ee_to_camera = None
     else:
         raise ValueError("camera_via_landmark expects eye_to_hand fixed camera.")
@@ -1539,11 +1540,11 @@ def run_camera_via_landmark_calibration(
 
 def validate_scene_calibration(robot: HandEyeRobot, cfg: CalibrationRunConfig) -> dict[str, Any]:
     scene = _load_scene(robot, cfg)
-    T_robot_to_ee = robot.read_robot_to_ee(cfg.robot_pose_frame)
+    T_ee_to_robot = robot.read_ee_to_robot(cfg.robot_pose_frame)
     out_path = save_scene_calibration(
         scene,
         _resolve_output_path(robot, cfg),
-        T_robot_to_ee=T_robot_to_ee,
+        T_ee_to_robot=T_ee_to_robot,
     )
     from .io import describe_npz
 
@@ -1566,10 +1567,10 @@ ChArUco 视觉标定
 
 输出 NPZ (~/.cache/.../<robot_id>_calibration.npz):
   {camera}__camera_matrix, {camera}__dist_coeffs     内参
-  {camera}__T_robot_to_camera                        固定相机外参 (top)
+  {camera}__T_camera_to_robot                        固定相机外参 (top)
   {camera}__T_ee_to_camera                           腕部相机外参 (wrist)
-  {camera}__T_robot_to_camera_resolved             validate 时写入的合成外参
-  T_robot_to_table                                   桌面坐标系
+  {camera}__T_camera_to_robot_resolved             validate 时写入的合成外参
+  T_table_to_robot                                   桌面坐标系
   table_grid_points_robot_mm                         桌面 ChArUco 角点 (机器人系, mm)
   charuco_*                                          标定板参数
 

@@ -42,8 +42,8 @@ class HandEyeRobot(Protocol):
 
     def disconnect(self) -> None: ...
 
-    def read_robot_to_ee(self, frame: RobotPoseFrame) -> np.ndarray:
-        """Return ``T_robot_to_ee`` as 4x4 (mm + deg, robot-specific frame)."""
+    def read_ee_to_robot(self, frame: RobotPoseFrame) -> np.ndarray:
+        """Return ``T_ee_to_robot`` as 4x4 (mm + deg, robot-specific frame)."""
         ...
 
 
@@ -84,7 +84,7 @@ class CrpArmHandEyeAdapter:
     def disconnect(self) -> None:
         self._robot.disconnect()
 
-    def read_robot_to_ee(self, frame: RobotPoseFrame) -> np.ndarray:
+    def read_ee_to_robot(self, frame: RobotPoseFrame) -> np.ndarray:
         if frame == RobotPoseFrame.USER:
             x, y, z, roll, pitch, yaw = self._robot.crp_arm_robot.read_end_pose_user()
         else:
