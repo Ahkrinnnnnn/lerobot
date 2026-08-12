@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import functools
+import logging
+import random
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -25,7 +27,8 @@ import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
 
 from lerobot.datasets import LeRobotDataset
-from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, REWARD
+from lerobot.rl.ee_abs_to_delta import abs_ee_action_to_delta, detect_offline_ee_action_mode
+from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_STATE, REWARD
 from lerobot.utils.transition import Transition
 
 
@@ -418,6 +421,10 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        image_shapes: dict[str, tuple[int, ...]] | None = None,
+        convert_abs_ee_action_to_delta: bool | None = None,
+        offline_ee_action_override: str | None = None,
+        include_rpy: bool = True,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -427,23 +434,22 @@ class ReplayBuffer:
             device (str): The device for sampling tensors. Defaults to "cuda:0".
             state_keys (Sequence[str] | None): The list of keys that appear in `state` and `next_state`.
             capacity (int | None): Buffer capacity. If None, uses dataset length.
-            action_mask (Sequence[int] | None): Indices of action dimensions to keep.
             image_augmentation_function (Callable | None): Function for image augmentation.
                 If None, uses default random shift with pad=4.
             use_drq (bool): Whether to use DrQ image augmentation when sampling.
             storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
+            image_shapes: Optional ``{feature_key: (C, H, W)}`` used to resize dataset images
+                to the policy input size (avoids allocating full-resolution frames in the buffer).
+            convert_abs_ee_action_to_delta: If True/False force abs→delta conversion; ``None`` auto.
+            offline_ee_action_override: Optional ``"abs"`` / ``"delta"`` passed to detector.
+            include_rpy: When converting abs→delta, keep δrpy (7D) or drop to δxyz+grip (4D).
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
         """
         if capacity is None:
             capacity = len(lerobot_dataset)
-
-        if capacity < len(lerobot_dataset):
-            raise ValueError(
-                "The capacity of the ReplayBuffer must be greater than or equal to the length of the LeRobotDataset."
-            )
 
         # Create replay buffer with image augmentation and DrQ settings
         replay_buffer = cls(
@@ -457,7 +463,26 @@ class ReplayBuffer:
         )
 
         # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
+        list_transition = cls._lerobotdataset_to_transitions(
+            dataset=lerobot_dataset,
+            state_keys=state_keys,
+            image_shapes=image_shapes,
+            convert_abs_ee_action_to_delta=convert_abs_ee_action_to_delta,
+            offline_ee_action_override=offline_ee_action_override,
+            include_rpy=include_rpy,
+        )
+
+        # If the offline buffer is smaller than the dataset, keep a random subset.
+        # Prefer limiting ``dataset.episodes`` upstream so conversion does not decode every frame.
+        if len(list_transition) > capacity:
+            logging.warning(
+                "Offline ReplayBuffer capacity (%s) < dataset transitions (%s); "
+                "randomly keeping %s transitions.",
+                capacity,
+                len(list_transition),
+                capacity,
+            )
+            list_transition = random.sample(list_transition, capacity)
 
         # Initialize the buffer with the first transition to set up storage tensors
         if list_transition:
@@ -960,7 +985,7 @@ class ReplayBuffer:
 
             # Fill the data for state keys
             for key in self.states:
-                frame_dict[key] = self.states[key][actual_idx].cpu()
+                frame_dict[key] = self._prepare_value_for_dataset(key, self.states[key][actual_idx])
 
             # Fill action, reward, done
             frame_dict[ACTION] = self.actions[actual_idx].cpu()
@@ -998,9 +1023,47 @@ class ReplayBuffer:
         return lerobot_dataset
 
     @staticmethod
+    def _prepare_value_for_dataset(key: str, value: torch.Tensor) -> torch.Tensor:
+        """Convert buffer tensors into values accepted by LeRobotDataset image writers.
+
+        Offline demos often keep images as float tensors in ``[0, 255]``. The writer
+        only accepts ``uint8`` in ``[0, 255]`` or float in ``[0, 1]``.
+        """
+        value = value.detach().cpu()
+        is_image = key.startswith(OBS_IMAGE) or (value.ndim == 3 and value.shape[0] in (1, 3))
+        if not is_image or value.dtype == torch.uint8:
+            return value
+
+        vmax = float(value.max()) if value.numel() else 0.0
+        if vmax > 1.0 + 1e-3:
+            return value.clamp(0, 255).round().to(torch.uint8)
+        return (value.clamp(0, 1) * 255.0).round().to(torch.uint8)
+
+    @staticmethod
+    def _maybe_resize_image(tensor: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+        """Resize a CHW / BCHW image tensor to ``target_shape`` ``(C, H, W)``."""
+        if len(target_shape) != 3:
+            return tensor
+        target_c, target_h, target_w = target_shape
+        has_batch = tensor.ndim == 4
+        image = tensor if has_batch else tensor.unsqueeze(0)
+        if image.shape[-3] != target_c:
+            raise ValueError(
+                f"Image channel mismatch: got {tuple(image.shape)} but target shape is {target_shape}"
+            )
+        if image.shape[-2:] != (target_h, target_w):
+            image = F.interpolate(image, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return image if has_batch else image.squeeze(0)
+
+    @classmethod
     def _lerobotdataset_to_transitions(
+        cls,
         dataset: LeRobotDataset,
         state_keys: Sequence[str] | None = None,
+        image_shapes: dict[str, tuple[int, ...]] | None = None,
+        convert_abs_ee_action_to_delta: bool | None = None,
+        offline_ee_action_override: str | None = None,
+        include_rpy: bool = True,
     ) -> list[Transition]:
         """
         Convert a LeRobotDataset into a list of RL (s, a, r, s', done) transitions.
@@ -1022,6 +1085,10 @@ class ReplayBuffer:
                 will be kept as-is in the output transitions. E.g.
                 ["observation.state", "observation.environment_state"].
                 If None, you must handle or define default keys.
+            image_shapes: Optional map from image feature key to ``(C, H, W)`` policy size.
+            convert_abs_ee_action_to_delta: Force / disable abs EE→delta conversion.
+            offline_ee_action_override: Optional ``"abs"`` / ``"delta"`` for auto-detect.
+            include_rpy: Keep δrpy in converted actions when True.
 
         Returns:
             transitions (list[Transition]):
@@ -1033,38 +1100,66 @@ class ReplayBuffer:
         transitions = []
         num_frames = len(dataset)
 
-        # Check if the dataset has "next.done" key
         sample = dataset[0]
         has_done_key = DONE in sample
+        has_reward_key = REWARD in sample
 
-        # Check for complementary_info keys
         complementary_info_keys = [key for key in sample if key.startswith("complementary_info.")]
         has_complementary_info = len(complementary_info_keys) > 0
 
-        # If not, we need to infer it from episode boundaries
         if not has_done_key:
-            print("'next.done' key not found in dataset. Inferring from episode boundaries...")
+            logging.warning("'next.done' key not found in dataset. Inferring from episode boundaries...")
+        if not has_reward_key:
+            logging.warning(
+                "'next.reward' key not found in dataset. Assuming successful demos with sparse "
+                "reward: 0 on non-terminal steps, 1 on episode end."
+            )
+        if image_shapes:
+            logging.info("Resizing offline images to policy shapes: %s", image_shapes)
+
+        features = getattr(getattr(dataset, "meta", None), "features", None)
+        mode = detect_offline_ee_action_mode(features, override=offline_ee_action_override)
+        if convert_abs_ee_action_to_delta is None:
+            convert_abs_ee_action_to_delta = mode == "abs"
+        if convert_abs_ee_action_to_delta:
+            logging.info(
+                "offline EE abs→delta: converting actions in memory "
+                "(include_rpy=%s → %sD; gripper abs); disk dataset unchanged",
+                include_rpy,
+                7 if include_rpy else 4,
+            )
+        elif mode == "delta":
+            logging.info("offline EE already delta — skip abs→delta conversion")
+
+        def _state_from_sample(frame: dict) -> dict[str, torch.Tensor]:
+            state: dict[str, torch.Tensor] = {}
+            for key in state_keys:
+                val = frame[key]
+                if image_shapes is not None and key in image_shapes:
+                    val = cls._maybe_resize_image(val, image_shapes[key])
+                state[key] = val.unsqueeze(0)
+            return state
 
         for i in tqdm(range(num_frames)):
             current_sample = dataset[i]
-
-            # ----- 1) Current state -----
-            current_state: dict[str, torch.Tensor] = {}
-            for key in state_keys:
-                val = current_sample[key]
-                current_state[key] = val.unsqueeze(0)  # Add batch dimension
-
-            # ----- 2) Action -----
-            action = current_sample[ACTION].unsqueeze(0)  # Add batch dimension
-
-            # ----- 3) Reward and done -----
-            reward = float(current_sample[REWARD].item())  # ensure float
-
-            # Determine done flag - use next.done if available, otherwise infer from episode boundaries
-            if has_done_key:
-                done = bool(current_sample[DONE].item())  # ensure bool
+            current_state = _state_from_sample(current_sample)
+            raw_action = current_sample[ACTION]
+            if convert_abs_ee_action_to_delta:
+                # Prefer observation.state from the frame (recording: obs = prev action).
+                state_vec = current_sample.get(OBS_STATE)
+                if state_vec is None and OBS_STATE in current_state:
+                    state_vec = current_state[OBS_STATE].reshape(-1)
+                if state_vec is None:
+                    raise KeyError("abs→delta conversion requires observation.state")
+                action = abs_ee_action_to_delta(
+                    raw_action, state_vec, include_rpy=include_rpy
+                ).unsqueeze(0)
             else:
-                # If this is the last frame or if next frame is in a different episode, mark as done
+                action = raw_action.unsqueeze(0)
+
+            if has_done_key:
+                done = bool(current_sample[DONE].item())
+            else:
                 done = False
                 if i == num_frames - 1:
                     done = True
@@ -1073,50 +1168,42 @@ class ReplayBuffer:
                     if next_sample["episode_index"] != current_sample["episode_index"]:
                         done = True
 
+            if has_reward_key:
+                reward = float(current_sample[REWARD].item())
+            else:
+                reward = 1.0 if done else 0.0
+
             # TODO: (azouitine) Handle truncation (using the same value as done for now)
             truncated = done
 
-            # ----- 4) Next state -----
-            # If not done and the next sample is in the same episode, we pull the next sample's state.
-            # Otherwise (done=True or next sample crosses to a new episode), next_state = current_state.
-            next_state = current_state  # default
+            next_state = current_state
             if not done and (i < num_frames - 1):
                 next_sample = dataset[i + 1]
                 if next_sample["episode_index"] == current_sample["episode_index"]:
-                    # Build next_state from the same keys
-                    next_state_data: dict[str, torch.Tensor] = {}
-                    for key in state_keys:
-                        val = next_sample[key]
-                        next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
-                    next_state = next_state_data
+                    next_state = _state_from_sample(next_sample)
 
-            # ----- 5) Complementary info (if available) -----
             complementary_info = None
             if has_complementary_info:
                 complementary_info = {}
                 for key in complementary_info_keys:
-                    # Strip the "complementary_info." prefix to get the actual key
                     clean_key = key[len("complementary_info.") :]
                     val = current_sample[key]
-                    # Handle tensor and non-tensor values differently
                     if isinstance(val, torch.Tensor):
-                        complementary_info[clean_key] = val.unsqueeze(0)  # Add batch dimension
+                        complementary_info[clean_key] = val.unsqueeze(0)
                     else:
-                        # TODO: (azouitine) Check if it's necessary to convert to tensor
-                        # For non-tensor values, use directly
                         complementary_info[clean_key] = val
 
-            # ----- Construct the Transition -----
-            transition = Transition(
-                state=current_state,
-                action=action,
-                reward=reward,
-                next_state=next_state,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
+            transitions.append(
+                Transition(
+                    state=current_state,
+                    action=action,
+                    reward=reward,
+                    next_state=next_state,
+                    done=done,
+                    truncated=truncated,
+                    complementary_info=complementary_info,
+                )
             )
-            transitions.append(transition)
 
         return transitions
 

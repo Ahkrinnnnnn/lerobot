@@ -26,6 +26,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from lerobot import envs
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
+from lerobot.utils.constants import CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK, PRETRAINED_MODEL_DIR
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
@@ -35,6 +36,42 @@ from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
+
+
+def _cli_config_path() -> str | None:
+    """Return ``--config_path`` from argv, accepting both ``=`` and space forms."""
+    import sys
+
+    path = parser.parse_arg("config_path")
+    if path:
+        return path
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--config_path" and i + 1 < len(args) and not args[i + 1].startswith("--"):
+            return args[i + 1]
+    return None
+
+
+def _resolve_resume_pretrained_dir(output_dir: Path | str | None, config_path: str | None) -> Path | None:
+    """Resolve ``pretrained_model`` directory for resume.
+
+    Preference:
+    1. ``config_path`` is already ``.../pretrained_model/train_config.json``
+    2. ``{output_dir}/checkpoints/last/pretrained_model/train_config.json``
+    """
+    if config_path:
+        cfg_file = Path(config_path).expanduser().resolve()
+        if cfg_file.is_file() and cfg_file.name == TRAIN_CONFIG_NAME:
+            return cfg_file.parent
+        # Directory that already contains train_config.json
+        if cfg_file.is_dir() and (cfg_file / TRAIN_CONFIG_NAME).is_file():
+            return cfg_file
+
+    if output_dir is not None:
+        candidate = Path(output_dir).expanduser() / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK / PRETRAINED_MODEL_DIR
+        if (candidate / TRAIN_CONFIG_NAME).is_file():
+            return candidate.resolve()
+    return None
 
 
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -152,19 +189,18 @@ class TrainPipelineConfig(HubMixin):
             )
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
-            config_path = parser.parse_arg("config_path")
-            if not config_path:
+            config_path = _cli_config_path()
+            policy_dir = _resolve_resume_pretrained_dir(self.output_dir, config_path)
+            if policy_dir is None:
+                hint = (
+                    f"{{output_dir}}/{CHECKPOINTS_DIR}/{LAST_CHECKPOINT_LINK}/{PRETRAINED_MODEL_DIR}/{TRAIN_CONFIG_NAME}"
+                )
                 raise ValueError(
-                    f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
+                    "resume=True but could not find a checkpoint. Either:\n"
+                    f"  - set output_dir so that {hint} exists, or\n"
+                    f"  - pass --config_path=/path/to/{TRAIN_CONFIG_NAME} under a checkpoint."
                 )
 
-            if not Path(config_path).resolve().exists():
-                raise NotADirectoryError(
-                    f"{config_path=} is expected to be a local path. "
-                    "Resuming from the hub is not supported for now."
-                )
-
-            policy_dir = Path(config_path).parent
             if self.policy is not None:
                 self.policy.pretrained_path = policy_dir
             if self.reward_model is not None:
@@ -194,7 +230,7 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if isinstance(self.dataset.repo_id, list):
+        if self.dataset is not None and isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):

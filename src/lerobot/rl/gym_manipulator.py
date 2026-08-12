@@ -57,6 +57,10 @@ from lerobot.robots import (  # noqa: F401
     make_robot_from_config,
     so_follower,
 )
+from lerobot.robots.crp_arm import CRPArm
+from lerobot.robots.crp_arm.config_crp_arm import CRPArmConfig  # noqa: F401 — register crp_arm
+from lerobot.robots.crp_arm.ee_gp import send_gp_endpose6
+from lerobot.robots.crp_arm.hil_ee_processor import CRPDeltaEEToAbsoluteGPStep, CRPJointInterventionGPAssistStep
 from lerobot.robots.robot import Robot
 from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
@@ -71,12 +75,54 @@ from lerobot.teleoperators import (
     make_teleoperator_from_config,
     so_leader,  # noqa: F401
 )
+from lerobot.teleoperators.OMY_L100.config_OMY_L100 import OMYL100Config  # noqa: F401
+from lerobot.teleoperators.OMY_L100.OMY_L100 import OMYL100  # noqa: F401
+from lerobot.teleoperators.keyboard_hil_events import wait_for_manual_scene_reset
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
+from lerobot.tools import TrajectoryProcessor
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.import_utils import require_package
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_CRP_JOINT_NAMES = ("j1", "j2", "j3", "j4", "j5", "j6")
+
+
+def _robot_has_bus(robot: Robot) -> bool:
+    bus = getattr(robot, "bus", None)
+    return bus is not None and getattr(bus, "motors", None) is not None
+
+
+def _joint_names_from_robot(robot: Robot) -> list[str]:
+    """Motor base names (without ``.pos``) for SO bus robots or CRP-style joints."""
+    if _robot_has_bus(robot):
+        return list(robot.bus.motors.keys())
+
+    names: list[str] = []
+    obs_features = getattr(robot, "observation_features", None)
+    if isinstance(obs_features, dict):
+        for key in obs_features:
+            if isinstance(key, str) and key.endswith(".pos"):
+                base = key.removesuffix(".pos")
+                if base != "gripper":
+                    names.append(base)
+    if names:
+        return names
+
+    action_features = getattr(robot, "action_features", None)
+    if isinstance(action_features, dict):
+        for key in action_features:
+            if isinstance(key, str) and key.endswith(".pos"):
+                base = key.removesuffix(".pos")
+                if base != "gripper":
+                    names.append(base)
+    if names:
+        return names
+
+    return list(DEFAULT_CRP_JOINT_NAMES)
 
 from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 
@@ -107,16 +153,36 @@ class GymManipulatorConfig:
 
 def reset_follower_position(robot_arm: Robot, target_position: np.ndarray) -> None:
     """Reset robot arm to target position using smooth trajectory."""
-    current_position_dict = robot_arm.bus.sync_read("Present_Position")
+    if _robot_has_bus(robot_arm):
+        current_position_dict = robot_arm.bus.sync_read("Present_Position")
+        current_position = np.array(
+            [current_position_dict[name] for name in current_position_dict], dtype=np.float32
+        )
+        trajectory = torch.from_numpy(np.linspace(current_position, target_position, 50))
+        for pose in trajectory:
+            action_dict = dict(zip(current_position_dict, pose, strict=False))
+            robot_arm.bus.sync_write("Goal_Position", action_dict)
+            precise_sleep(0.015)
+        return
+
+    joint_names = _joint_names_from_robot(robot_arm)
+    try:
+        obs = robot_arm.get_observation(include_images=False)
+    except TypeError:
+        obs = robot_arm.get_observation()
+
     current_position = np.array(
-        [current_position_dict[name] for name in current_position_dict], dtype=np.float32
+        [float(obs.get(f"{name}.pos", 0.0)) for name in joint_names], dtype=np.float32
     )
-    trajectory = torch.from_numpy(
-        np.linspace(current_position, target_position, 50)
-    )  # NOTE: 30 is just an arbitrary number
+    target = np.asarray(target_position, dtype=np.float32)
+    if target.shape[0] != len(joint_names):
+        raise ValueError(
+            f"reset_pose length {target.shape[0]} does not match joint count {len(joint_names)}"
+        )
+    trajectory = np.linspace(current_position, target, 50)
     for pose in trajectory:
-        action_dict = dict(zip(current_position_dict, pose, strict=False))
-        robot_arm.bus.sync_write("Goal_Position", action_dict)
+        action_dict = {f"{name}.pos": float(pose[i]) for i, name in enumerate(joint_names)}
+        robot_arm.send_action(action_dict)
         precise_sleep(0.015)
 
 
@@ -130,6 +196,12 @@ class RobotEnv(gym.Env):
         display_cameras: bool = False,
         reset_pose: list[float] | None = None,
         reset_time_s: float = 5.0,
+        action_mode: str = "joint",
+        episode_reset_pause_key: str | None = None,
+        crp_gp_start_index: int = 10,
+        crp_gp_group_size: int = 5,
+        teleop_device: Teleoperator | None = None,
+        ee_include_rpy: bool = True,
     ) -> None:
         """Initialize robot environment with configuration options.
 
@@ -138,12 +210,26 @@ class RobotEnv(gym.Env):
             use_gripper: Whether to include gripper in action space.
             display_cameras: Whether to show camera feeds during execution.
             reset_pose: Joint positions for environment reset.
-            reset_time_s: Time to wait during reset.
+            reset_time_s: Time to wait during reset (manual scene reset window).
+            action_mode: ``joint`` (SO / GJ) or ``ee_gp`` (CRP absolute GP tensor).
+            episode_reset_pause_key: Key that pauses the scene-reset countdown.
+            crp_gp_start_index: GP register start index for CRP ``send_GPs``.
+            crp_gp_group_size: TrajectoryProcessor group size for CRP GP matrix.
+            teleop_device: Optional teleop (used for HIL keyboard reset pause / OMY latch).
+            ee_include_rpy: When ``action_mode=ee_gp``, policy action includes δrpy (7D vs 4D).
         """
         super().__init__()
 
         self.robot = robot
         self.display_cameras = display_cameras
+        self.action_mode = action_mode
+        self.episode_reset_pause_key = episode_reset_pause_key
+        self.crp_gp_start_index = crp_gp_start_index
+        self.crp_gp_group_size = crp_gp_group_size
+        self.teleop_device = teleop_device
+        self.ee_include_rpy = ee_include_rpy
+        self._trajectory_processor: TrajectoryProcessor | None = None
+        self._episode_index = 0
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -153,7 +239,7 @@ class RobotEnv(gym.Env):
         self.current_step = 0
         self.episode_data = None
 
-        self._joint_names = [f"{key}.pos" for key in self.robot.bus.motors]
+        self._joint_names = _joint_names_from_robot(self.robot)
         self._image_keys = self.robot.cameras.keys()
 
         self.reset_pose = reset_pose
@@ -161,19 +247,79 @@ class RobotEnv(gym.Env):
 
         self.use_gripper = use_gripper
 
-        self._joint_names = list(self.robot.bus.motors.keys())
         self._raw_joint_positions = None
+        # EE-GP delayed proprio: last commanded EE+gripper (matches recording obs=prev action).
+        self._ee_command_cache: np.ndarray | None = None
+
+        if self.action_mode == "ee_gp":
+            self._trajectory_processor = TrajectoryProcessor()
+            # Do not seed from a previous session's EE cache; GI56 stays off until arm-ready.
+            if hasattr(self.robot, "clear_ee_cache"):
+                self.robot.clear_ee_cache()
+            if hasattr(self.robot, "set_motion_enabled"):
+                self.robot.set_motion_enabled(False)
+            self._seed_ee_command_cache()
 
         self._setup_spaces()
+
+    def _seed_ee_command_cache(self) -> None:
+        """Initialize EE command cache from a **fresh SDK** endpose (+ GOT).
+
+        Never falls back to ``_last_ee_cache`` (recording: pre-arm reads must be live).
+        """
+        if hasattr(self.robot, "clear_ee_cache"):
+            # Drop any latched pose so get_current_endpose cannot serve stale coordinates.
+            self.robot.clear_ee_cache()
+        pose = list(self.robot.get_current_endpose(allow_cache_fallback=False))
+        grip = 0.0
+        if self.use_gripper and hasattr(self.robot, "get_GOT"):
+            try:
+                grip = float(self.robot.get_GOT(0))
+            except Exception:
+                grip = 0.0
+        self._ee_command_cache = np.asarray([*pose[:6], grip], dtype=np.float32)
+        if hasattr(self.robot, "update_ee_cache_from_pose6"):
+            self.robot.update_ee_cache_from_pose6(pose[:6])
+
+    def _refresh_ee_command_cache_from_robot(self) -> None:
+        """Pull latest GP command / EE cache published by the intervention stream."""
+        cached = getattr(self.robot, "_last_ee_cache", None) or {}
+        keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+        if not all(k in cached for k in keys):
+            return
+        grip = 0.0
+        if self.use_gripper:
+            try:
+                joints = (
+                    self.robot.get_last_cached_joints()
+                    if hasattr(self.robot, "get_last_cached_joints")
+                    else {}
+                )
+                if "gripper.pos" in joints:
+                    grip = float(joints["gripper.pos"])
+                elif hasattr(self.robot, "get_GOT"):
+                    grip = float(self.robot.get_GOT(0))
+            except Exception:
+                if self._ee_command_cache is not None and self._ee_command_cache.size >= 7:
+                    grip = float(self._ee_command_cache[6])
+        self._ee_command_cache = np.asarray(
+            [float(cached[k]) for k in keys] + [grip],
+            dtype=np.float32,
+        )
 
     def _get_observation(self) -> RobotObservation:
         """Get current robot observation including joint positions and camera images."""
         obs_dict = self.robot.get_observation()
         raw_joint_joint_position = {f"{name}.pos": obs_dict[f"{name}.pos"] for name in self._joint_names}
-        joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
-
         images = {key: obs_dict[key] for key in self._image_keys}
 
+        if self.action_mode == "ee_gp":
+            if self._ee_command_cache is None:
+                self._seed_ee_command_cache()
+            agent_pos = np.asarray(self._ee_command_cache, dtype=np.float32).copy()
+            return {"agent_pos": agent_pos, "pixels": images, **raw_joint_joint_position}
+
+        joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
         return {"agent_pos": joint_positions, "pixels": images, **raw_joint_joint_position}
 
     def _setup_spaces(self) -> None:
@@ -203,60 +349,219 @@ class RobotEnv(gym.Env):
 
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
-        # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
-        bounds = {}
-        bounds["min"] = -np.ones(action_dim)
-        bounds["max"] = np.ones(action_dim)
+        if self.action_mode == "joint":
+            # CRP joint targets: j1..j6 (+ optional gripper), matching IL datasets like inserting_rod.
+            n_joints = len(self._joint_names)
+            action_dim = n_joints + (1 if self.use_gripper else 0)
+            self.action_space = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(action_dim,),
+                dtype=np.float32,
+            )
+        else:
+            # Policy / teleop operate in EE delta space (xyz [+rpy] + optional gripper).
+            action_dim = 6 if self.ee_include_rpy else 3
+            bounds = {}
+            bounds["min"] = -np.ones(action_dim)
+            bounds["max"] = np.ones(action_dim)
 
-        if self.use_gripper:
-            action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
+            if self.use_gripper:
+                action_dim += 1
+                bounds["min"] = np.concatenate([bounds["min"], [0]])
+                bounds["max"] = np.concatenate([bounds["max"], [2]])
 
-        self.action_space = gym.spaces.Box(
-            low=bounds["min"],
-            high=bounds["max"],
-            shape=(action_dim,),
-            dtype=np.float32,
-        )
+            self.action_space = gym.spaces.Box(
+                low=bounds["min"],
+                high=bounds["max"],
+                shape=(action_dim,),
+                dtype=np.float32,
+            )
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[RobotObservation, dict[str, Any]]:
-        """Reset environment to initial state.
+        """Reset environment to initial state."""
+        # Close MOVE gate before scene rearrange so leftover GP cannot chase during reset.
+        if self.action_mode == "ee_gp" and hasattr(self.robot, "set_motion_enabled"):
+            self.robot.set_motion_enabled(False)
+        if self.action_mode == "ee_gp" and hasattr(self.robot, "clear_ee_cache"):
+            self.robot.clear_ee_cache()
+            self._ee_command_cache = None
 
-        Args:
-            seed: Random seed for reproducibility.
-            options: Additional reset options.
-
-        Returns:
-            Tuple of (observation, info) dictionaries.
-        """
-        # Reset the robot
-        # self.robot.reset()
         start_time = time.perf_counter()
         if self.reset_pose is not None:
             log_say("Reset the environment.", play_sounds=True)
             reset_follower_position(self.robot, np.array(self.reset_pose))
             log_say("Reset the environment done.", play_sounds=True)
 
-        precise_sleep(max(self.reset_time_s - (time.perf_counter() - start_time), 0.0))
+        remaining = max(self.reset_time_s - (time.perf_counter() - start_time), 0.0)
+        keyboard_events = getattr(self.teleop_device, "_hil_keyboard", None) if self.teleop_device else None
+        pause_key = self.episode_reset_pause_key
+        if pause_key is None and keyboard_events is not None:
+            pause_key = getattr(keyboard_events, "_reset_pause_key", None)
+        if remaining > 0 and (
+            keyboard_events is not None or (pause_key and self.action_mode == "ee_gp")
+        ):
+            wait_for_manual_scene_reset(
+                remaining,
+                episode_index=self._episode_index,
+                pause_key=pause_key or "p",
+                # Always pass keyboard when present so s/f/r latched during the wait
+                # are cleared (even if pause_key is null and pause is unused).
+                keyboard_events=keyboard_events,
+            )
+        else:
+            precise_sleep(remaining)
+        if keyboard_events is not None:
+            keyboard_events.clear_episode_flags()
+
+        if self.teleop_device is not None and hasattr(self.teleop_device, "reset_reference"):
+            self.teleop_device.reset_reference()
 
         super().reset(seed=seed, options=options)
 
         # Reset episode tracking variables.
         self.current_step = 0
         self.episode_data = None
+        self._episode_index += 1
+        if self.action_mode == "ee_gp":
+            # Re-seed command cache from pose after manual reset (GI56 still off until first send).
+            self._seed_ee_command_cache()
         obs = self._get_observation()
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
         return obs, {TeleopEvents.IS_INTERVENTION: False}
 
-    def step(self, action) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
-        """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+    def _as_1d_float_action(self, action) -> np.ndarray:
+        """Policy / processors often leave a batch dim ``(1, D)``; env.step needs ``(D,)``."""
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        return np.asarray(action, dtype=np.float32).reshape(-1)
 
-        self.robot.send_action(joint_targets_dict)
+    def _arm_ee_gp_motion_gate(self, seed_pose6: list[float]) -> None:
+        """Recording-style arm-ready: preload GP → GI→GP → **then** GI56 ON.
+
+        GI56 must stay off until GP registers hold the latched pose; opening the gate on
+        stale GP (or after trusting an old EE cache) snaps the arm.
+        """
+        if self._trajectory_processor is None:
+            self._trajectory_processor = TrajectoryProcessor()
+        seed = [float(v) for v in seed_pose6[:6]]
+        # Ensure we do not silently re-use a previous episode pose via cache.
+        if hasattr(self.robot, "clear_ee_cache"):
+            self.robot.clear_ee_cache()
+        send_gp_endpose6(
+            self.robot,
+            self._trajectory_processor,
+            seed,
+            start_index=self.crp_gp_start_index,
+            group_size=self.crp_gp_group_size,
+            switch_to_gp_mode=False,
+        )
+        if hasattr(self.robot, "ensure_gp_mode"):
+            self.robot.ensure_gp_mode()
+        if hasattr(self.robot, "update_ee_cache_from_pose6"):
+            self.robot.update_ee_cache_from_pose6(seed)
+        if hasattr(self.robot, "set_motion_enabled"):
+            self.robot.set_motion_enabled(True)
+        logger.info(
+            "HIL EE policy arm-ready: preloaded GP xyz=(%.3f %.3f %.3f) then GI56 ON "
+            "(gate was closed; no MOVE before this)",
+            seed[0],
+            seed[1],
+            seed[2],
+        )
+
+    def _send_ee_gp_action(self, action) -> None:
+        """Send absolute GP pose (+ optional gripper) from the CRP EE processor."""
+        values = self._as_1d_float_action(action).tolist()
+
+        if len(values) < 6:
+            raise ValueError(f"ee_gp action must have at least 6 values, got {len(values)}")
+
+        vec6 = [float(v) for v in values[:6]]
+        if self._trajectory_processor is None:
+            self._trajectory_processor = TrajectoryProcessor()
+
+        # Recording rule: until arm-ready, never open GI56. Fresh-latch pose, preload, then gate.
+        gate_open = True
+        if hasattr(self.robot, "is_motion_enabled"):
+            gate_open = bool(self.robot.is_motion_enabled())
+        if not gate_open:
+            # Prefer a live SDK pose for the latch (not a leftover command cache from last ep).
+            if hasattr(self.robot, "clear_ee_cache"):
+                self.robot.clear_ee_cache()
+            seed = list(self.robot.get_current_endpose(allow_cache_fallback=False))
+            grip_seed = 0.0
+            if self.use_gripper and hasattr(self.robot, "get_GOT"):
+                try:
+                    grip_seed = float(self.robot.get_GOT(0))
+                except Exception:
+                    grip_seed = 0.0
+            self._ee_command_cache = np.asarray([*seed[:6], grip_seed], dtype=np.float32)
+            self._arm_ee_gp_motion_gate(seed)
+            # First armed command holds the latched pose (delta applied on subsequent steps).
+            # Avoid chasing a policy target that was computed against a pre-latch reference.
+            vec6 = list(seed[:6])
+            values = list(seed[:6]) + ([grip_seed] if self.use_gripper else [])
+
+        send_gp_endpose6(
+            self.robot,
+            self._trajectory_processor,
+            vec6,
+            start_index=self.crp_gp_start_index,
+            group_size=self.crp_gp_group_size,
+            switch_to_gp_mode=False,
+        )
+
+        grip = 0.0
+        if self.use_gripper and len(values) > 6 and hasattr(self.robot, "set_GOT"):
+            grip = float(values[6])
+            # Discrete gamepad codes {0,1,2} → leave / close / open-ish; else treat as GOT0 value.
+            if grip in (0.0, 1.0, 2.0) and grip == int(grip):
+                if int(grip) == 0:
+                    self.robot.set_GOT(0, 0)
+                    grip = 0.0
+                elif int(grip) == 2:
+                    self.robot.set_GOT(0, 1000)
+                    grip = 1000.0
+                else:
+                    # code 1 = leave current; keep latched GOT if we just armed.
+                    if self._ee_command_cache is not None and self._ee_command_cache.size >= 7:
+                        grip = float(self._ee_command_cache[6])
+            else:
+                grip = float(int(max(0, min(1000, round(grip)))))
+                self.robot.set_GOT(0, int(grip))
+        elif self._ee_command_cache is not None and self._ee_command_cache.size >= 7:
+            grip = float(self._ee_command_cache[6])
+
+        # Delayed proprio = last commanded EE (+ gripper), matching recording.
+        self._ee_command_cache = np.asarray([*vec6, grip], dtype=np.float32)
+        if hasattr(self.robot, "update_ee_cache_from_pose6"):
+            self.robot.update_ee_cache_from_pose6(vec6)
+
+    def step(self, action, *, apply_action: bool = True) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
+        """Execute one environment step with given action.
+
+        Args:
+            action: Policy / teleop action for this step.
+            apply_action: If False, only refresh observation (used when joint-space HIL
+                already sent a GP command during intervention — must not also ``send_GJs``).
+        """
+        if apply_action:
+            if self.action_mode == "ee_gp":
+                self._send_ee_gp_action(action)
+            else:
+                action = self._as_1d_float_action(action)
+                joint_targets_dict = {
+                    f"{key}.pos": float(action[i]) for i, key in enumerate(self._joint_names)
+                }
+                if self.use_gripper and action.shape[0] > len(self._joint_names):
+                    joint_targets_dict["gripper.pos"] = float(action[len(self._joint_names)])
+                self.robot.send_action(joint_targets_dict)
+        elif self.action_mode == "ee_gp":
+            # Intervention stream owns send_GPs; keep obs command-cache in sync.
+            self._refresh_ee_command_cache_from_robot()
 
         obs = self._get_observation()
 
@@ -344,12 +649,58 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
     )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
+    reset_time_s = cfg.processor.reset.reset_time_s if cfg.processor.reset is not None else 5.0
+    episode_reset_pause_key = (
+        cfg.processor.reset.episode_reset_pause_key if cfg.processor.reset is not None else None
+    )
+    # Fall back to teleop HIL pause key so a single JSON field (hil_reset_pause_key) is enough.
+    if not episode_reset_pause_key and cfg.teleop is not None:
+        episode_reset_pause_key = getattr(cfg.teleop, "hil_reset_pause_key", None)
+
+    if cfg.processor.crp_ee is not None and cfg.processor.inverse_kinematics is not None:
+        raise ValueError("processor.crp_ee and processor.inverse_kinematics are mutually exclusive")
+
+    crp_action_space = getattr(cfg.processor, "crp_action_space", "ee") or "ee"
+    if crp_action_space not in ("ee", "joint"):
+        raise ValueError(f"processor.crp_action_space must be 'ee' or 'joint', got {crp_action_space!r}")
+    if crp_action_space == "ee" and cfg.processor.crp_ee is None and cfg.processor.inverse_kinematics is None:
+        # CRP EE path needs crp_ee; SO path uses inverse_kinematics instead.
+        if cfg.robot is not None and getattr(cfg.robot, "type", None) == "crp_arm":
+            raise ValueError("processor.crp_action_space='ee' requires processor.crp_ee for crp_arm")
+
+    if crp_action_space == "joint":
+        action_mode = "joint"
+    elif cfg.processor.crp_ee is not None:
+        action_mode = "ee_gp"
+    else:
+        action_mode = "joint"
+
+    if isinstance(robot, CRPArm):
+        logger.info(
+            "HIL CRP action_space=%s → RobotEnv.action_mode=%s "
+            "(joint = policy GJ via send_GJs; ee_gp = policy send_GPs)",
+            crp_action_space,
+            action_mode,
+        )
+
+    crp_gp_start_index = cfg.processor.crp_ee.gp_start_index if cfg.processor.crp_ee is not None else 10
+    crp_gp_group_size = cfg.processor.crp_ee.gp_group_size if cfg.processor.crp_ee is not None else 5
+    ee_include_rpy = (
+        bool(cfg.processor.crp_ee.include_rpy) if cfg.processor.crp_ee is not None else True
+    )
 
     env = RobotEnv(
         robot=robot,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
         reset_pose=reset_pose,
+        reset_time_s=reset_time_s,
+        action_mode=action_mode,
+        episode_reset_pause_key=episode_reset_pause_key,
+        crp_gp_start_index=crp_gp_start_index,
+        crp_gp_group_size=crp_gp_group_size,
+        teleop_device=teleop_device,
+        ee_include_rpy=ee_include_rpy,
     )
 
     return env, teleop_device
@@ -407,8 +758,10 @@ def make_processors(
         )
 
     # Full processor pipeline for real robot environment
-    # Get robot and motor information for kinematics
-    motor_names = list(env.robot.bus.motors.keys())
+    motor_names = _joint_names_from_robot(env.robot)
+
+    if cfg.processor.crp_ee is not None and cfg.processor.inverse_kinematics is not None:
+        raise ValueError("processor.crp_ee and processor.inverse_kinematics are mutually exclusive")
 
     # Set up kinematics solver if inverse kinematics is configured
     kinematics_solver = None
@@ -424,8 +777,11 @@ def make_processors(
     if cfg.processor.observation is not None:
         if cfg.processor.observation.add_joint_velocity_to_observation:
             env_pipeline_steps.append(JointVelocityProcessorStep(dt=1.0 / cfg.fps))
-        if cfg.processor.observation.add_current_to_observation:
+        # Motor current requires Dynamixel/Feetech bus — skip for CRP.
+        if cfg.processor.observation.add_current_to_observation and _robot_has_bus(env.robot):
             env_pipeline_steps.append(MotorCurrentProcessorStep(robot=env.robot))
+        elif cfg.processor.observation.add_current_to_observation:
+            logger.warning("add_current_to_observation ignored: robot has no motor bus")
 
     add_ee_pose = (
         cfg.processor.observation is not None and cfg.processor.observation.add_ee_pose_to_observation
@@ -483,22 +839,65 @@ def make_processors(
     env_pipeline_steps.append(AddBatchDimensionProcessorStep())
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
+    use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+    crp_action_space = getattr(cfg.processor, "crp_action_space", "ee") or "ee"
+
     action_pipeline_steps = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
-        InterventionActionProcessorStep(
-            use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
-            terminate_on_success=terminate_on_success,
-        ),
     ]
 
-    # Replace InverseKinematicsProcessor with new kinematic processors
-    if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
-        # Add EE bounds and safety processor
+    # OMY relative xyz → GP stream (recording arming). Labels: joint or ee_delta.
+    include_rpy = bool(cfg.processor.crp_ee.include_rpy) if cfg.processor.crp_ee is not None else True
+    if isinstance(env.robot, CRPArm) and cfg.processor.crp_ee is not None:
+        action_pipeline_steps.append(
+            CRPJointInterventionGPAssistStep(
+                robot=env.robot,
+                teleop=teleop_device,
+                end_effector_step_sizes=cfg.processor.crp_ee.end_effector_step_sizes,
+                ee_delta_scale=cfg.processor.crp_ee.ee_delta_scale,
+                use_gripper=use_gripper,
+                gp_start_index=cfg.processor.crp_ee.gp_start_index,
+                gp_group_size=cfg.processor.crp_ee.gp_group_size,
+                gp_secondary_index=cfg.processor.crp_ee.gp_secondary_index,
+                omy_ee_ready_timeout_s=cfg.processor.crp_ee.hil_omy_ee_ready_timeout_s,
+                gp_stream_hz=cfg.processor.crp_ee.hil_gp_stream_hz,
+                rl_label_space="ee_delta" if crp_action_space == "ee" else "joint",
+                include_rpy=include_rpy,
+            )
+        )
+
+    action_pipeline_steps.append(
+        InterventionActionProcessorStep(
+            use_gripper=use_gripper,
+            terminate_on_success=terminate_on_success,
+            action_space="joint" if crp_action_space == "joint" else "ee",
+            robot=env.robot if crp_action_space == "joint" else None,
+            joint_names=motor_names,
+            include_rpy=include_rpy if crp_action_space == "ee" else False,
+        )
+    )
+
+    # CRP EE GP path (skips SO IK) — autonomous + intervention both in EE delta space
+    if crp_action_space == "ee" and cfg.processor.crp_ee is not None:
+        if not isinstance(env.robot, CRPArm):
+            raise TypeError("processor.crp_ee requires robot.type=crp_arm")
+        action_pipeline_steps.extend(
+            [
+                MapTensorToDeltaActionDictStep(use_gripper=use_gripper, include_rpy=include_rpy),
+                CRPDeltaEEToAbsoluteGPStep(
+                    robot=env.robot,
+                    end_effector_step_sizes=cfg.processor.crp_ee.end_effector_step_sizes,
+                    use_gripper=use_gripper,
+                    use_latched_reference=cfg.processor.crp_ee.use_latched_reference,
+                    ee_delta_max=cfg.processor.crp_ee.ee_delta_max,
+                ),
+            ]
+        )
+    # SO InverseKinematics path
+    elif cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
-            ),
+            MapTensorToDeltaActionDictStep(use_gripper=use_gripper),
             MapDeltaActionToRobotActionStep(),
             EEReferenceAndDelta(
                 kinematics=kinematics_solver,
@@ -521,6 +920,13 @@ def make_processors(
         ]
         action_pipeline_steps.extend(inverse_kinematics_steps)
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    # Joint-space CRP: policy tensor is already j1..j6(+gripper); RobotEnv.send_action handles it.
+    elif crp_action_space == "joint":
+        pass
+    else:
+        logger.warning(
+            "No CRP EE / joint / IK action chain configured; env.step will receive raw policy actions"
+        )
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
@@ -558,7 +964,11 @@ def step_env_and_process_transition(
     processed_action_transition = action_processor(transition)
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
-    obs, reward, terminated, truncated, info = env.step(processed_action)
+    # Joint-space HIL: CRPJointInterventionGPAssistStep already issued send_GPs while intervening.
+    # The action tensor is then replaced with CRP joints for RL labels — must not send_GJs too.
+    complementary_pre = processed_action_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+    apply_action = not bool(complementary_pre.get("crp_gp_command_sent", False))
+    obs, reward, terminated, truncated, info = env.step(processed_action, apply_action=apply_action)
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
@@ -597,7 +1007,16 @@ def reset_and_build_transition(
     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
 ) -> EnvTransition:
-    """Reset env + processors and return the first env-processed transition."""
+    """Reset env + processors and return the first env-processed transition.
+
+    Stop the HIL GP stream **before** ``env.reset()`` scene wait. Otherwise Space
+    intervention keeps sending absolute GP (possibly huge OMY deltas) during the
+    countdown — looks like unrestricted motion and can snap when GI56 re-opens.
+    """
+    try:
+        action_processor.reset()
+    except Exception:
+        logging.exception("action_processor.reset before env.reset failed")
     obs, info = env.reset()
     env_processor.reset()
     action_processor.reset()

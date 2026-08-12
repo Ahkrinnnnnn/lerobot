@@ -285,6 +285,44 @@ class ResetConfig:
     reset_time_s: float = 5.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True
+    # During ``reset_time_s`` scene-reset window, this key toggles countdown pause.
+    # Default ``None`` so Space is reserved for HIL intervention only.
+    episode_reset_pause_key: str | None = None
+    # Episodes with fewer kept transitions than this are not pushed to the learner
+    # (filters accidental 1-frame s/f terminations). ``0`` disables the filter.
+    min_episode_steps_for_replay: int = 10
+
+
+@dataclass
+class CRPEndEffectorControlConfig:
+    """CRP end-effector GP control for HIL-SERL (skips SO inverse kinematics)."""
+
+    # Per-axis scale on OMY→CRP relative xyz (negative = invert that axis).
+    end_effector_step_sizes: dict[str, float] = field(
+        default_factory=lambda: {"x": 1.0, "y": 1.0, "z": 1.0}
+    )
+    # Overall scale on OMY position delta before adding to latched CRP p0. ``None`` → code default 1.5.
+    ee_delta_scale: float | None = None
+    # Per-step clamp on policy ``|δxyz|`` before applying to GP (mm). ``None`` = no clamp.
+    ee_delta_max: float | None = 5.0
+    # If True, policy/teleop/offline delta includes δroll/pitch/yaw (action dim 6+grip).
+    # If False, only δxyz (+ gripper); absolute rpy is held from the EE command reference.
+    include_rpy: bool = True
+    # Offline demo action semantics: ``None`` = auto-detect from feature names;
+    # ``"abs"`` force abs→delta conversion; ``"delta"`` skip conversion.
+    offline_ee_action: str | None = None
+    gp_start_index: int = 10
+    gp_group_size: int = 5
+    # If True, latch EE reference at episode reset; deltas are relative to that pose.
+    # If False, each step uses the current EE pose as reference (gamepad-style).
+    # Orientation always follows the reference pose (no handwritten fixed rpy).
+    use_latched_reference: bool = False
+    # Secondary GP register warm-up for joint HIL (recording uses 20). ``None`` = primary only.
+    gp_secondary_index: int | None = 20
+    # Wait for first OMY EE sample on Space press before latching ``omy_ref``.
+    hil_omy_ee_ready_timeout_s: float = 5.0
+    # Background ``send_GPs`` rate while Space is held (recording uses 100 Hz).
+    hil_gp_stream_hz: float = 100.0
 
 
 @dataclass
@@ -292,11 +330,19 @@ class HILSerlProcessorConfig:
     """Configuration for environment processing pipeline."""
 
     control_mode: str = "gamepad"
+    # CRP learning / control space: ``ee`` (delta → send_GPs) or ``joint`` (j1..j6 → send_GJs).
+    # ``joint`` aligns with IL datasets that store CRP joint actions (e.g. inserting_rod).
+    # Intervention motion can still use OMY EE→GP; the RL action label is read from CRP joints.
+    crp_action_space: str = "ee"
     observation: ObservationConfig | None = None
     image_preprocessing: ImagePreprocessingConfig | None = None
     gripper: GripperConfig | None = None
     reset: ResetConfig | None = None
     inverse_kinematics: InverseKinematicsConfig | None = None
+    # EE GP settings. Required when ``crp_action_space="ee"``; for ``joint`` used only to
+    # drive the arm during Space intervention (OMY EE → GP), while learning labels are CRP joints.
+    # Must be ``None`` when ``inverse_kinematics`` is set.
+    crp_ee: CRPEndEffectorControlConfig | None = None
     reward_classifier: RewardClassifierConfig | None = None
     max_gripper_pos: float | None = 100.0
 

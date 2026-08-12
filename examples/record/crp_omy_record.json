@@ -1,0 +1,61 @@
+{
+  "robot": {
+    "type": "crp_arm",
+    "port": "192.168.0.100",
+    "use_gripper_feature": true,
+    "max_relative_target": 1.0,
+    "motion_mode_gi_index": 55,
+    "gp_mode_gi_value": 1,
+    "gj_mode_gi_value": 0,
+    "speed_ratio_on_connect": 80,
+    "cameras": {
+      "top": {
+        "type": "opencv",
+        "index_or_path": 6,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      },
+      "wrist": {
+        "type": "opencv",
+        "index_or_path": 14,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      }
+    },
+    "enable_joint": false,
+    "enable_ee": true,
+    "motion_enable_gi_index": 56,
+    "motion_enable_on_value": 1,
+    "motion_enable_off_value": 0
+  },
+  "teleop": {
+    "type": "OMY_L100",
+    "port": "dummy",
+    "ros_ee_pose_position_scale": 1000.0,
+    "ros_gripper_joint_name": "rh_r1_joint"
+  },
+  "dataset": {
+    "repo_id": "dataset/Insert_blue_tube_zyy",
+    "single_task": "Insert the blue tube into the purple base",
+    "root": "/home/dingyuxuan/zyy/lerobot/outputs/Insert_blue_tube_zyy_0807_01_ee",
+    "fps": 30,
+    "episode_time_s": 6000,
+    "reset_time_s": 3,
+    "num_episodes": 16,
+    "video": true,
+    "push_to_hub": false
+  },
+  "display_data": false,
+  "play_sounds": true,
+  "speed_ratio": 80,
+  "ee_delta_scale": 1.5,
+  "ee_step_sizes": {
+    "x": 1.0,
+    "y": 1.0,
+    "z": 1.0
+  },
+  "resume": true,
+  "reset_teleop": false
+}

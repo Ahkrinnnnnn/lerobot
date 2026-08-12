@@ -51,6 +51,20 @@ class OMYL100Config(TeleoperatorConfig):
     # ``reliable``: KEEP_LAST 10 RELIABLE (typical ``self_collision_node`` / leader EE). ``sensor``: BEST_EFFORT.
     ros_ee_pose_qos: str = "reliable"
     # Multiply EE position (``Pose`` / ``PoseStamped.pose``) — typical SI: meters → mm for CRP-style inputs.
-    ros_ee_pose_position_scale: float = 1.0
+    ros_ee_pose_position_scale: float = 1000.0
+    # When True, ``get_action()`` returns HIL ``delta_x/y/z`` (+ gripper) and enables ``get_teleop_events()``.
+    # Default False preserves joint ``j*.pos`` actions used by recording scripts.
+    hil_ee_delta: bool = False
+    # Divide incremental OMY EE deltas by this factor so values are roughly in ``[-1, 1]`` for HIL.
+    hil_ee_delta_norm: float = 1.0
+    # Include gripper in HIL EE action dict when ``hil_ee_delta`` is True.
+    hil_use_gripper: bool = True
+    hil_intervene_key: str = "space"
+    hil_success_key: str = "s"
+    hil_failure_key: str = "f"
+    hil_rerecord_key: str = "r"
+    # Scene-reset countdown pause key. Must not reuse ``hil_intervene_key`` (Space).
+    # ``None`` disables pause-during-reset.
+    hil_reset_pause_key: str | None = None
 
 

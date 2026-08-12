@@ -44,6 +44,53 @@ from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
 
 logger = logging.getLogger(__name__)
 
+_COLOR_FOURCC = frozenset({"YUYV", "YUY2", "MJPG", "JPEG", "UYVY"})
+_SKIP_FOURCC = frozenset({"Z16", "GREY", "BA81", "YV12", "Y8", "Y16", "Y10", "Y12"})
+
+
+def _opencv_fourcc(cam_meta: dict[str, Any]) -> str:
+    """Best-effort pixel format for an OpenCV/V4L2 node."""
+    import re
+    import shutil
+    import subprocess
+
+    profile = cam_meta.get("default_stream_profile") or {}
+    fourcc = "".join(c for c in str(profile.get("fourcc") or "") if c.isalnum()).upper()
+    if fourcc:
+        return fourcc
+    cam_id = cam_meta.get("id")
+    if isinstance(cam_id, str) and cam_id.startswith("/dev/video") and shutil.which("v4l2-ctl"):
+        try:
+            out = subprocess.check_output(
+                ["v4l2-ctl", "-d", cam_id, "--get-fmt-video"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+            match = re.search(r"Pixel Format\s*:\s*'([^']+)'", out)
+            if match:
+                return "".join(c for c in match.group(1) if c.isalnum()).upper()
+        except Exception:
+            pass
+    return ""
+
+
+def _should_skip_opencv_capture(cam_meta: dict[str, Any]) -> bool:
+    """Skip depth/IR/metadata nodes that hang or segfault under OpenCV."""
+    fourcc = _opencv_fourcc(cam_meta)
+    if fourcc in _SKIP_FOURCC:
+        return True
+    if fourcc in _COLOR_FOURCC:
+        return False
+    profile = cam_meta.get("default_stream_profile") or {}
+    try:
+        if int(profile.get("height") or 0) == 400:
+            return True
+    except (TypeError, ValueError):
+        pass
+    # Unknown format: do not open for capture.
+    return True
+
 
 def find_all_opencv_cameras() -> list[dict[str, Any]]:
     """
@@ -116,56 +163,30 @@ def find_all_orbbec_cameras() -> list[dict[str, Any]]:
 
 def find_and_print_cameras(
     camera_type_filter: str | None = None,
-    *,
-    include_opencv: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Finds available cameras based on an optional filter and prints their information.
 
-    Args:
-        camera_type_filter: Optional string to filter cameras ("realsense", "opencv", or "orbbec").
-                            If None, lists Orbbec + RealSense, and OpenCV only when no Orbbec
-                            devices are found (or when ``include_opencv=True``).
-        include_opencv: When scanning all camera types, force the OpenCV/V4L2 probe even if
-            Orbbec devices are present. Orbbec Gemini cameras should use the OrbbecSDK path
-            instead of ``/dev/video*``.
-
-    Returns:
-        A list of all available cameras matching the filter, with their metadata.
+    Default (no filter): OpenCV + RealSense. Orbbec is only probed when
+    ``camera_type_filter="orbbec"`` (avoids OrbbecSDK log spam / broken installs).
     """
     all_cameras_info: list[dict[str, Any]] = []
 
     if camera_type_filter:
         camera_type_filter = camera_type_filter.lower()
 
-    orbbec_cameras_info: list[dict[str, Any]] = []
-    if camera_type_filter is None or camera_type_filter == "orbbec":
-        orbbec_cameras_info = find_all_orbbec_cameras()
-        all_cameras_info.extend(orbbec_cameras_info)
-
+    if camera_type_filter is None or camera_type_filter == "opencv":
+        all_cameras_info.extend(find_all_opencv_cameras())
     if camera_type_filter is None or camera_type_filter == "realsense":
         all_cameras_info.extend(find_all_realsense_cameras())
-
-    scan_opencv = camera_type_filter == "opencv"
-    if camera_type_filter is None:
-        if include_opencv or not orbbec_cameras_info:
-            scan_opencv = True
-        else:
-            logger.info(
-                "Skipping OpenCV V4L2 scan (%d Orbbec device(s) detected). "
-                "Use `lerobot-find-cameras orbbec` for Orbbec serial numbers, or "
-                "`lerobot-find-cameras --include-opencv` to probe /dev/video* anyway.",
-                len(orbbec_cameras_info),
-            )
-
-    if scan_opencv:
-        all_cameras_info.extend(find_all_opencv_cameras())
+    if camera_type_filter == "orbbec":
+        all_cameras_info.extend(find_all_orbbec_cameras())
 
     if not all_cameras_info:
         if camera_type_filter:
             logger.warning(f"No {camera_type_filter} cameras were detected.")
         else:
-            logger.warning("No cameras (OpenCV, RealSense, or Orbbec) were detected.")
+            logger.warning("No cameras (OpenCV or RealSense) were detected.")
     else:
         print("\n--- Detected Cameras ---")
         for i, cam_info in enumerate(all_cameras_info):
@@ -210,6 +231,11 @@ def create_camera_instance(cam_meta: dict[str, Any]) -> dict[str, Any] | None:
     cam_type = cam_meta.get("type")
     cam_id = cam_meta.get("id")
     instance = None
+
+    # Orbbec UVC exposes depth/IR nodes; opening them via OpenCV can hang/segfault.
+    if cam_type == "OpenCV" and _should_skip_opencv_capture(cam_meta):
+        logger.info("Skipping non-color OpenCV node %s", cam_id)
+        return None
 
     logger.info(f"Preparing {cam_type} ID {cam_id} with default profile")
 
@@ -293,7 +319,6 @@ def save_images_from_all_cameras(
     output_dir: Path,
     record_time_s: float = 2.0,
     camera_type: str | None = None,
-    include_opencv: bool = False,
 ):
     """
     Connects to detected cameras (optionally filtered by type) and saves images from each.
@@ -303,15 +328,11 @@ def save_images_from_all_cameras(
         output_dir: Directory to save images.
         record_time_s: Duration in seconds to record images.
         camera_type: Optional string to filter cameras ("realsense", "opencv", or "orbbec").
-                            If None, uses Orbbec + RealSense (+ OpenCV when safe).
-        include_opencv: Force OpenCV/V4L2 probing when scanning all camera types.
+                            If None, uses OpenCV + RealSense.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving images to {output_dir}")
-    all_camera_metadata = find_and_print_cameras(
-        camera_type_filter=camera_type,
-        include_opencv=include_opencv,
-    )
+    all_camera_metadata = find_and_print_cameras(camera_type_filter=camera_type)
 
     if not all_camera_metadata:
         logger.warning("No cameras detected matching the criteria. Cannot save images.")
@@ -365,12 +386,7 @@ def main():
         default=None,
         choices=["realsense", "opencv", "orbbec"],
         help="Specify camera type to capture from (e.g., 'realsense', 'opencv', 'orbbec'). "
-        "Default (omit): Orbbec + RealSense; OpenCV only if no Orbbec devices are found.",
-    )
-    parser.add_argument(
-        "--include-opencv",
-        action="store_true",
-        help="When scanning all camera types, also probe OpenCV /dev/video* even if Orbbec devices are connected.",
+        "Default (omit): OpenCV + RealSense. Use 'orbbec' for OrbbecSDK.",
     )
     parser.add_argument(
         "--output-dir",

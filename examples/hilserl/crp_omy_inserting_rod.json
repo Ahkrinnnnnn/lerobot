@@ -1,0 +1,261 @@
+{
+  "output_dir": "outputs/hilserl_crp_omy_inserting_rod_ee",
+  "job_name": "hilserl_crp_omy_inserting_rod_ee",
+  "resume": true,
+  "seed": 1000,
+  "num_workers": 0,
+  "batch_size": 256,
+  "steps": 50000,
+  "log_freq": 100,
+  "save_checkpoint": true,
+  "save_freq": 5000,
+  "wandb": {
+    "enable": false,
+    "project": "hilserl_crp_omy_inserting_rod_ee",
+    "disable_artifact": true
+  },
+  "dataset": {
+    "repo_id": "local/Insert_blue_tube_zyy_0807_01_ee",
+    "root": "/home/dingyuxuan/zyy/lerobot/outputs/Insert_blue_tube_zyy_0807_01_ee",
+    "use_imagenet_stats": false,
+    "episodes": null
+  },
+  "mixer": "online_offline",
+  "online_ratio": 0.5,
+  "algorithm": {
+    "type": "sac",
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "temperature_lr": 0.0003,
+    "discount": 0.97,
+    "use_backup_entropy": true,
+    "critic_target_update_weight": 0.005,
+    "num_critics": 2,
+    "temperature_init": 0.01,
+    "target_entropy": -2.0,
+    "utd_ratio": 10,
+    "policy_update_freq": 1,
+    "grad_clip_norm": 40.0
+  },
+  "policy": {
+    "type": "gaussian_actor",
+    "n_obs_steps": 1,
+    "repo_id": "local/hilserl_crp_omy_inserting_rod_ee",
+    "push_to_hub": false,
+    "normalization_mapping": {
+      "VISUAL": "MEAN_STD",
+      "STATE": "MIN_MAX",
+      "ENV": "MIN_MAX",
+      "ACTION": "MIN_MAX"
+    },
+    "input_features": {
+      "observation.images.top": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      },
+      "observation.images.wrist": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      },
+      "observation.state": {
+        "type": "STATE",
+        "shape": [
+          7
+        ]
+      }
+    },
+    "output_features": {
+      "action": {
+        "type": "ACTION",
+        "shape": [
+          4
+        ]
+      }
+    },
+    "device": "cuda",
+    "use_amp": false,
+    "storage_device": "cpu",
+    "vision_encoder_name": "lerobot/resnet10",
+    "freeze_vision_encoder": true,
+    "image_encoder_hidden_dim": 32,
+    "shared_encoder": true,
+    "num_discrete_actions": null,
+    "online_steps": 50000,
+    "online_buffer_capacity": 32000,
+    "offline_buffer_capacity": 8000,
+    "online_step_before_learning": 100,
+    "state_encoder_hidden_dim": 64,
+    "latent_dim": 256,
+    "actor_network_kwargs": {
+      "hidden_dims": [
+        256,
+        256
+      ],
+      "activate_final": true
+    },
+    "policy_kwargs": {
+      "use_tanh_squash": true,
+      "std_min": 1e-05,
+      "std_max": 10.0,
+      "init_final": 0.05
+    },
+    "actor_learner_config": {
+      "learner_host": "127.0.0.1",
+      "learner_port": 50051,
+      "policy_parameters_push_frequency": 4
+    },
+    "concurrency": {
+      "actor": "threads",
+      "learner": "threads"
+    }
+  },
+  "env": {
+    "type": "gym_manipulator",
+    "name": "real_robot",
+    "fps": 30,
+    "features": {
+      "action": {
+        "type": "ACTION",
+        "shape": [
+          4
+        ]
+      },
+      "observation.state": {
+        "type": "STATE",
+        "shape": [
+          7
+        ]
+      },
+      "observation.images.top": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      },
+      "observation.images.wrist": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      }
+    },
+    "features_map": {
+      "action": "action",
+      "observation.state": "observation.state",
+      "observation.images.top": "observation.images.top",
+      "observation.images.wrist": "observation.images.wrist"
+    },
+    "robot": {
+      "type": "crp_arm",
+      "port": "192.168.0.100",
+      "use_gripper_feature": true,
+      "max_relative_target": 0.5,
+      "motion_mode_gi_index": 55,
+      "gp_mode_gi_value": 1,
+      "gj_mode_gi_value": 0,
+      "speed_ratio_on_connect": 80,
+      "cameras": {
+        "top": {
+          "type": "opencv",
+          "index_or_path": 6,
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        "wrist": {
+          "type": "opencv",
+          "index_or_path": 14,
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        }
+      },
+      "motion_enable_gi_index": 56,
+      "motion_enable_on_value": 1,
+      "motion_enable_off_value": 0
+    },
+    "teleop": {
+      "type": "OMY_L100",
+      "port": "dummy",
+      "ros_ee_pose_position_scale": 1000.0,
+      "hil_ee_delta": true,
+      "hil_use_gripper": true,
+      "hil_ee_delta_norm": 1.0,
+      "hil_intervene_key": "space",
+      "hil_success_key": "s",
+      "hil_failure_key": "f",
+      "hil_rerecord_key": "r",
+      "hil_reset_pause_key": "p"
+    },
+    "processor": {
+      "control_mode": "leader",
+      "crp_action_space": "ee",
+      "observation": {
+        "display_cameras": false,
+        "add_joint_velocity_to_observation": false,
+        "add_current_to_observation": false,
+        "add_ee_pose_to_observation": false
+      },
+      "image_preprocessing": {
+        "crop_params_dict": {
+          "observation.images.top": [
+            0,
+            90,
+            240,
+            320
+          ]
+        },
+        "resize_size": [
+          128,
+          128
+        ]
+      },
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": 0.0
+      },
+      "reset": {
+        "fixed_reset_joint_positions": null,
+        "reset_time_s": 10.0,
+        "control_time_s": 30.0,
+        "terminate_on_success": true,
+        "episode_reset_pause_key": "p",
+        "min_episode_steps_for_replay": 10
+      },
+      "inverse_kinematics": null,
+      "crp_ee": {
+        "end_effector_step_sizes": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        },
+        "ee_delta_scale": 1.5,
+        "ee_delta_max": 5.0,
+        "include_rpy": false,
+        "offline_ee_action": null,
+        "gp_start_index": 10,
+        "gp_group_size": 5,
+        "gp_secondary_index": 20,
+        "use_latched_reference": false,
+        "hil_omy_ee_ready_timeout_s": 5.0,
+        "hil_gp_stream_hz": 100.0
+      },
+      "reward_classifier": {
+        "pretrained_path": null
+      },
+      "max_gripper_pos": 1000.0
+    }
+  }
+}

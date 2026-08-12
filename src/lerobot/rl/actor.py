@@ -88,8 +88,11 @@ from lerobot.configs import parser
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.processor import TransitionKey
 from lerobot.robots import so_follower  # noqa: F401
+from lerobot.robots.crp_arm.config_crp_arm import CRPArmConfig  # noqa: F401 — register crp_arm
 from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+from lerobot.teleoperators.OMY_L100.config_OMY_L100 import OMYL100Config  # noqa: F401 — register OMY_L100
 from lerobot.teleoperators.utils import TeleopEvents
+from lerobot.utils.constants import ACTION
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.random_utils import set_seed
@@ -149,6 +152,7 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     logging.info("[ACTOR] Establishing connection with Learner")
     if not establish_learner_connection(learner_client, shutdown_event):
         logging.error("[ACTOR] Failed to establish connection with Learner")
+        grpc_channel.close()
         return
 
     if not use_threads(cfg):
@@ -205,28 +209,47 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
         logging.info("[ACTOR] Policy loop finished")
     except Exception:
         logging.exception("[ACTOR] Unhandled exception in act_with_policy")
-        shutdown_event.set()
     finally:
+        # Signal workers first so they stop before we close shared queues/channels.
+        shutdown_event.set()
+        logging.info("[ACTOR] Waiting for worker threads/processes")
+        transitions_process.join(timeout=10)
+        logging.info("[ACTOR] Transitions process joined")
+        interactions_process.join(timeout=10)
+        logging.info("[ACTOR] Interactions process joined")
+        receive_policy_process.join(timeout=10)
+        logging.info("[ACTOR] Receive policy process joined")
+
         logging.info("[ACTOR] Closing queues")
         transitions_queue.close()
         interactions_queue.close()
         parameters_queue.close()
 
-        transitions_process.join()
-        logging.info("[ACTOR] Transitions process joined")
-        interactions_process.join()
-        logging.info("[ACTOR] Interactions process joined")
-        receive_policy_process.join()
-        logging.info("[ACTOR] Receive policy process joined")
-
         transitions_queue.cancel_join_thread()
         interactions_queue.cancel_join_thread()
         parameters_queue.cancel_join_thread()
+
+        if grpc_channel is not None:
+            logging.info("[ACTOR] Closing gRPC channel")
+            grpc_channel.close()
 
         logging.info("[ACTOR] Cleanup complete")
 
 
 # Core algorithm functions
+
+
+def _hil_intervention_held(teleop_device: Any) -> bool:
+    """True while Space (or intervene key) is held — does not consume s/f/r one-shots."""
+    if teleop_device is None:
+        return False
+    kb = getattr(teleop_device, "_hil_keyboard", None)
+    if kb is None:
+        return False
+    try:
+        return bool(kb.intervening)
+    except Exception:
+        return False
 
 
 def act_with_policy(
@@ -262,171 +285,311 @@ def act_with_policy(
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
     env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
 
-    set_seed(cfg.seed)
-    device = get_safe_torch_device(cfg.policy.device, log=True)
+    try:
+        set_seed(cfg.seed)
+        device = get_safe_torch_device(cfg.policy.device, log=True)
 
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
-    logging.info("make_policy")
+        logging.info("make_policy")
 
-    ### Instantiate the policy in both the actor and learner processes
-    ### To avoid sending a policy object through the port, we create a policy instance
-    ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
-    policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-    )
-    policy = policy.to(device).eval()
-    assert isinstance(policy, nn.Module)
+        ### Instantiate the policy in both the actor and learner processes
+        ### To avoid sending a policy object through the port, we create a policy instance
+        ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
+        if cfg.dataset is not None:
+            from lerobot.datasets import LeRobotDatasetMetadata
 
-    # Build the algorithm
-    algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
-
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        dataset_stats=cfg.policy.dataset_stats,
-    )
-
-    transition = reset_and_build_transition(online_env, env_processor, action_processor)
-
-    # NOTE: For the moment we will solely handle the case of a single environment
-    sum_reward_episode = 0
-    list_transition_to_send_to_learner = []
-    episode_intervention = False
-    # Add counters for intervention rate calculation
-    episode_intervention_steps = 0
-    episode_total_steps = 0
-
-    policy_timer = TimerManager("Policy inference", log=False)
-
-    for interaction_step in range(cfg.policy.online_steps):
-        start_time = time.perf_counter()
-        if shutdown_event.is_set():
-            logging.info("[ACTOR] Shutting down act_with_policy")
-            return
-
-        observation = {
-            k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
-        }
-
-        # Time policy inference and check if it meets FPS requirement
-        with policy_timer:
-            normalized_observation = preprocessor.process_observation(observation)
-            action = policy.select_action(batch=normalized_observation)
-            # Unnormalize only the continuous part.
-            if cfg.policy.num_discrete_actions is not None:
-                continuous_action = postprocessor.process_action(action[..., :-1])
-                discrete_action = action[..., -1:].to(
-                    device=continuous_action.device, dtype=continuous_action.dtype
+            try:
+                ds_meta = LeRobotDatasetMetadata(
+                    cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
                 )
-                action = torch.cat([continuous_action, discrete_action], dim=-1)
+                if ds_meta.stats:
+                    from lerobot.datasets.utils import dataset_stats_to_policy_config
+
+                    feature_keys = list(cfg.policy.input_features) + list(cfg.policy.output_features)
+                    cfg.policy.dataset_stats = dataset_stats_to_policy_config(
+                        ds_meta.stats, feature_keys=feature_keys
+                    )
+                    logging.info("Loaded dataset_stats from %s", cfg.dataset.repo_id)
+
+                offline_override = None
+                include_rpy = True
+                if cfg.env is not None and getattr(cfg.env, "processor", None) is not None:
+                    crp_ee = getattr(cfg.env.processor, "crp_ee", None)
+                    if crp_ee is not None:
+                        offline_override = getattr(crp_ee, "offline_ee_action", None)
+                        include_rpy = bool(getattr(crp_ee, "include_rpy", True))
+                if offline_override != "delta":
+                    from lerobot.datasets import LeRobotDataset
+                    from lerobot.rl.ee_abs_to_delta import maybe_override_policy_action_stats_from_abs_ee_dataset
+
+                    _stats_ds = LeRobotDataset(
+                        cfg.dataset.repo_id,
+                        root=cfg.dataset.root,
+                        episodes=cfg.dataset.episodes,
+                        download_videos=False,
+                    )
+                    cfg.policy.dataset_stats = maybe_override_policy_action_stats_from_abs_ee_dataset(
+                        cfg.policy.dataset_stats,
+                        features=ds_meta.features,
+                        hf_dataset=_stats_ds.hf_dataset,
+                        override=offline_override,
+                        include_rpy=include_rpy,
+                    )
+                    del _stats_ds
+            except Exception:
+                logging.exception("Failed to load dataset_stats; keeping policy defaults")
+
+        from lerobot.datasets.utils import ensure_vector_stats_match_features
+
+        cfg.policy.dataset_stats = ensure_vector_stats_match_features(
+            cfg.policy.dataset_stats,
+            {**cfg.policy.input_features, **cfg.policy.output_features},
+        )
+
+        policy = make_policy(
+            cfg=cfg.policy,
+            env_cfg=cfg.env,
+        )
+        policy = policy.to(device).eval()
+        assert isinstance(policy, nn.Module)
+
+        # Build the algorithm
+        algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=cfg.policy,
+            dataset_stats=cfg.policy.dataset_stats,
+        )
+
+        transition = reset_and_build_transition(online_env, env_processor, action_processor)
+
+        # NOTE: For the moment we will solely handle the case of a single environment
+        sum_reward_episode = 0
+        list_transition_to_send_to_learner = []
+        episode_intervention = False
+        # Add counters for intervention rate calculation
+        episode_intervention_steps = 0
+        episode_total_steps = 0
+
+        policy_timer = TimerManager("Policy inference", log=False)
+
+        # When Space press/release excludes frames, drop the last kept transition once so
+        # the episode does not keep a (s, a, s') that straddles the mode-switch time gap.
+        excluding_gap = False
+        # Reused when Space is held so we never call select_action / GPU during intervention.
+        last_policy_action: torch.Tensor | None = None
+        action_feature = (cfg.policy.output_features or {}).get(ACTION)
+        default_action_dim = int(action_feature.shape[0]) if action_feature is not None else 4
+
+        for interaction_step in range(cfg.policy.online_steps):
+            start_time = time.perf_counter()
+            if shutdown_event.is_set():
+                logging.info("[ACTOR] Shutting down act_with_policy")
+                return
+
+            observation = {
+                k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
+            }
+
+            # Peek Space hold without consuming s/f/r (those are read in AddTeleopEventsAsInfoStep).
+            skip_policy = _hil_intervention_held(teleop_device)
+            if skip_policy:
+                # Placeholder only: intervention processors override action / skip env send.
+                if last_policy_action is not None:
+                    action = last_policy_action
+                else:
+                    action = torch.zeros(1, default_action_dim, device=device, dtype=torch.float32)
             else:
-                action = postprocessor.process_action(action)
-        policy_fps = policy_timer.fps_last
-
-        log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
-
-        # Use the new step function
-        new_transition = step_env_and_process_transition(
-            env=online_env,
-            transition=transition,
-            action=action,
-            env_processor=env_processor,
-            action_processor=action_processor,
-        )
-
-        # Extract values from processed transition
-        next_observation = {
-            k: v
-            for k, v in new_transition[TransitionKey.OBSERVATION].items()
-            if k in cfg.policy.input_features
-        }
-
-        # Teleop action is the action that was executed in the environment
-        # It is either the action from the teleop device or the action from the policy
-        executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
-
-        reward = new_transition[TransitionKey.REWARD]
-        done = new_transition.get(TransitionKey.DONE, False)
-        truncated = new_transition.get(TransitionKey.TRUNCATED, False)
-
-        sum_reward_episode += float(reward)
-        episode_total_steps += 1
-
-        # Check for intervention from transition info
-        intervention_info = new_transition[TransitionKey.INFO]
-        is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
-        if is_intervention:
-            episode_intervention = True
-            episode_intervention_steps += 1
-
-        complementary_info = {
-            "discrete_penalty": torch.tensor(
-                [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
-            ),
-            TeleopEvents.IS_INTERVENTION.value: is_intervention,
-        }
-        # Create transition for learner (convert to old format)
-        list_transition_to_send_to_learner.append(
-            Transition(
-                state=observation,
-                action=executed_action,
-                reward=reward,
-                next_state=next_observation,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
-            )
-        )
-
-        # Update transition for next iteration
-        transition = new_transition
-
-        if done or truncated:
-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
-            update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
-
-            if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
+                # Time policy inference and check if it meets FPS requirement
+                with policy_timer:
+                    normalized_observation = preprocessor.process_observation(observation)
+                    action = policy.select_action(batch=normalized_observation)
+                    # Unnormalize only the continuous part.
+                    if cfg.policy.num_discrete_actions is not None:
+                        continuous_action = postprocessor.process_action(action[..., :-1])
+                        discrete_action = action[..., -1:].to(
+                            device=continuous_action.device, dtype=continuous_action.dtype
+                        )
+                        action = torch.cat([continuous_action, discrete_action], dim=-1)
+                    else:
+                        action = postprocessor.process_action(action)
+                last_policy_action = action
+                log_policy_frequency_issue(
+                    policy_fps=policy_timer.fps_last, cfg=cfg, interaction_step=interaction_step
                 )
-                list_transition_to_send_to_learner = []
 
-            stats = get_frequency_stats(policy_timer)
-            policy_timer.reset()
-
-            # Calculate intervention rate
-            intervention_rate = 0.0
-            if episode_total_steps > 0:
-                intervention_rate = episode_intervention_steps / episode_total_steps
-
-            # Send episodic reward to the learner
-            interactions_queue.put(
-                python_object_to_bytes(
-                    {
-                        "Episodic reward": sum_reward_episode,
-                        "Interaction step": interaction_step,
-                        "Episode intervention": int(episode_intervention),
-                        "Intervention rate": intervention_rate,
-                        **stats,
-                    }
-                )
+            # Use the new step function
+            new_transition = step_env_and_process_transition(
+                env=online_env,
+                transition=transition,
+                action=action,
+                env_processor=env_processor,
+                action_processor=action_processor,
             )
 
-            # Reset intervention counters and environment
-            sum_reward_episode = 0.0
-            episode_intervention = False
-            episode_intervention_steps = 0
-            episode_total_steps = 0
+            # Extract values from processed transition
+            next_observation = {
+                k: v
+                for k, v in new_transition[TransitionKey.OBSERVATION].items()
+                if k in cfg.policy.input_features
+            }
 
-            transition = reset_and_build_transition(online_env, env_processor, action_processor)
+            # Teleop action is the action that was executed in the environment
+            # It is either the action from the teleop device or the action from the policy
+            complementary_data = new_transition[TransitionKey.COMPLEMENTARY_DATA]
+            executed_action = complementary_data["teleop_action"]
 
-        if cfg.env.fps is not None:
-            dt_time = time.perf_counter() - start_time
-            precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
+            reward = new_transition[TransitionKey.REWARD]
+            done = new_transition.get(TransitionKey.DONE, False)
+            truncated = new_transition.get(TransitionKey.TRUNCATED, False)
+
+            # Mode-switch / EE-ready latch frames (Space press/release) are not RL transitions.
+            exclude_from_replay = bool(complementary_data.get("exclude_from_replay", False))
+
+            # Check for intervention from transition info
+            intervention_info = new_transition[TransitionKey.INFO]
+            is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
+
+            if exclude_from_replay:
+                # Entering a switch gap: drop last transition so buffer segments stay continuous
+                # (its next_state would not match the first state after the gap).
+                if not excluding_gap and list_transition_to_send_to_learner:
+                    list_transition_to_send_to_learner.pop()
+                    logging.info(
+                        "[ACTOR] Dropped last transition before intervention switch gap "
+                        "(interaction_step=%s); gap frames not written to buffer",
+                        interaction_step,
+                    )
+                excluding_gap = True
+                logging.debug(
+                    "[ACTOR] Skipping transition (exclude_from_replay) at interaction_step=%s",
+                    interaction_step,
+                )
+            else:
+                excluding_gap = False
+                sum_reward_episode += float(reward)
+                episode_total_steps += 1
+                if is_intervention:
+                    episode_intervention = True
+                    episode_intervention_steps += 1
+
+                complementary_info = {
+                    "discrete_penalty": torch.tensor(
+                        [complementary_data.get("discrete_penalty", 0.0)]
+                    ),
+                    TeleopEvents.IS_INTERVENTION.value: is_intervention,
+                }
+                list_transition_to_send_to_learner.append(
+                    Transition(
+                        state=observation,
+                        action=executed_action,
+                        reward=reward,
+                        next_state=next_observation,
+                        done=done,
+                        truncated=truncated,
+                        complementary_info=complementary_info,
+                    )
+                )
+
+            # Update transition for next iteration
+            transition = new_transition
+
+            if done or truncated:
+                logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
+
+                # Stop GP stream immediately (before slow weight load / queue push / scene wait).
+                try:
+                    action_processor.reset()
+                except Exception:
+                    logging.exception("[ACTOR] action_processor.reset at episode end failed")
+
+                update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
+
+                min_steps = 0
+                if cfg.env is not None and getattr(cfg.env, "processor", None) is not None:
+                    reset_cfg = getattr(cfg.env.processor, "reset", None)
+                    if reset_cfg is not None:
+                        min_steps = int(getattr(reset_cfg, "min_episode_steps_for_replay", 0) or 0)
+
+                n_kept = len(list_transition_to_send_to_learner)
+                rerecord = bool(intervention_info.get(TeleopEvents.RERECORD_EPISODE, False))
+                if rerecord:
+                    logging.warning(
+                        "[ACTOR] Rerecord requested — discarding %s transitions "
+                        "(not sent to learner; interaction_step=%s)",
+                        n_kept,
+                        interaction_step,
+                    )
+                    list_transition_to_send_to_learner = []
+                elif n_kept > 0 and min_steps > 0 and n_kept < min_steps:
+                    logging.warning(
+                        "[ACTOR] Dropping short episode (%s transitions < min_episode_steps_for_replay=%s); "
+                        "not sent to learner (interaction_step=%s, reward=%.3f)",
+                        n_kept,
+                        min_steps,
+                        interaction_step,
+                        sum_reward_episode,
+                    )
+                    list_transition_to_send_to_learner = []
+                elif n_kept > 0:
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
+                    )
+                    list_transition_to_send_to_learner = []
+
+                stats = get_frequency_stats(policy_timer)
+                policy_timer.reset()
+
+                # Calculate intervention rate
+                intervention_rate = 0.0
+                if episode_total_steps > 0:
+                    intervention_rate = episode_intervention_steps / episode_total_steps
+
+                # Send episodic reward to the learner
+                interactions_queue.put(
+                    python_object_to_bytes(
+                        {
+                            "Episodic reward": sum_reward_episode,
+                            "Interaction step": interaction_step,
+                            "Episode intervention": int(episode_intervention),
+                            "Intervention rate": intervention_rate,
+                            **stats,
+                        }
+                    )
+                )
+
+                # Reset intervention counters and environment
+                sum_reward_episode = 0.0
+                episode_intervention = False
+                episode_intervention_steps = 0
+                episode_total_steps = 0
+                excluding_gap = False
+
+                transition = reset_and_build_transition(online_env, env_processor, action_processor)
+
+            if cfg.env.fps is not None:
+                dt_time = time.perf_counter() - start_time
+                precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
+
+    finally:
+        # Stop HIL GP stream before tearing down robot (avoids set_GOT/send_GPs vs disconnect races).
+        logging.info("[ACTOR] Disconnecting teleop / closing env")
+        try:
+            action_processor.reset()
+        except Exception:
+            logging.exception("[ACTOR] action_processor.reset failed")
+        try:
+            if teleop_device is not None:
+                teleop_device.disconnect()
+        except Exception:
+            logging.exception("[ACTOR] teleop disconnect failed")
+        try:
+            online_env.close()
+        except Exception:
+            logging.exception("[ACTOR] env close failed")
 
 
 #  Communication Functions - Group all gRPC/messaging functions
@@ -451,10 +614,12 @@ def establish_learner_connection(
             logging.info("[ACTOR] Shutting down establish_learner_connection")
             return False
 
-        # Force a connection attempt and check state
+        # Force a connection attempt and check state.
+        # Use a short timeout so Ctrl+C / shutdown_event can interrupt between retries
+        # (a hanging Ready with no deadline previously required a second Ctrl+C force exit).
         try:
             logging.info("[ACTOR] Send ready message to Learner")
-            if stub.Ready(services_pb2.Empty()) == services_pb2.Empty():
+            if stub.Ready(services_pb2.Empty(), timeout=2.0) == services_pb2.Empty():
                 return True
         except grpc.RpcError as e:
             logging.error(f"[ACTOR] Waiting for Learner to be ready... {e}")

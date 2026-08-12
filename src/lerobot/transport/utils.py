@@ -97,7 +97,11 @@ def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEve
             logging.debug(f"{log_prefix} Received data at step end size {bytes_buffer_size(bytes_buffer)}")
 
             if queue is not None:
-                queue.put(bytes_buffer.getvalue())
+                try:
+                    queue.put(bytes_buffer.getvalue())
+                except (OSError, ValueError):
+                    logging.info(f"{log_prefix} Queue closed while receiving, stopping")
+                    return
             else:
                 return bytes_buffer.getvalue()
 

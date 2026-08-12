@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import logging
+import threading
 import time
 from multiprocessing import Event, Queue
 from typing import TYPE_CHECKING
@@ -39,7 +40,9 @@ else:
     send_bytes_in_chunks = None
     _ServicerBase = object
 
-MAX_WORKERS = 3  # Stream parameters, send transitions and interactions
+# Ready + StreamParameters + SendTransitions + SendInteractions, with headroom for
+# stale actor reconnects (dead StreamParameters used to exhaust a pool of 3 and block Ready).
+MAX_WORKERS = 12
 SHUTDOWN_TIMEOUT = 10
 
 
@@ -65,45 +68,74 @@ class LearnerService(_ServicerBase):
         self.transition_queue = transition_queue
         self.interaction_message_queue = interaction_message_queue
         self.queue_get_timeout = queue_get_timeout
+        # Serialize parameter-queue drains across StreamParameters workers.
+        self._parameters_lock = threading.Lock()
+        # Only the newest StreamParameters stream should keep pushing; older ones exit.
+        self._stream_epoch = 0
+        self._stream_epoch_lock = threading.Lock()
 
     def StreamParameters(  # noqa: N802
         self, request: "services_pb2.Empty", context: "grpc.ServicerContext"
     ):
         # TODO: authorize the request
-        logging.info("[LEARNER] Received request to stream parameters from the Actor")
+        with self._stream_epoch_lock:
+            self._stream_epoch += 1
+            my_epoch = self._stream_epoch
+        logging.info(
+            "[LEARNER] Received request to stream parameters from the Actor (epoch=%s)", my_epoch
+        )
 
-        last_push_time = 0
+        last_push_time = 0.0
 
         while not self.shutdown_event.is_set():
+            # Drop streams from crashed / superseded actors so workers are not pinned forever.
+            if not context.is_active():
+                logging.info("[LEARNER] Actor disconnected, ending parameter stream (epoch=%s)", my_epoch)
+                break
+            with self._stream_epoch_lock:
+                if my_epoch != self._stream_epoch:
+                    logging.info(
+                        "[LEARNER] Parameter stream superseded by newer actor (epoch=%s), ending",
+                        my_epoch,
+                    )
+                    break
+
             time_since_last_push = time.time() - last_push_time
             if time_since_last_push < self.seconds_between_pushes:
                 self.shutdown_event.wait(self.seconds_between_pushes - time_since_last_push)
-                # Continue, because we could receive a shutdown event,
-                # and it's checked in the while loop
                 continue
 
             logging.info("[LEARNER] Push parameters to the Actor")
-            buffer = get_last_item_from_queue(
-                self.parameters_queue, block=True, timeout=self.queue_get_timeout
-            )
+            try:
+                with self._parameters_lock:
+                    buffer = get_last_item_from_queue(
+                        self.parameters_queue, block=True, timeout=self.queue_get_timeout
+                    )
+            except OSError:
+                logging.info("[LEARNER] Parameters queue closed, ending parameter stream")
+                break
 
             if buffer is None:
                 continue
 
-            yield from send_bytes_in_chunks(
-                buffer,
-                services_pb2.Parameters,
-                log_prefix="[LEARNER] Sending parameters",
-                silent=True,
-            )
+            try:
+                yield from send_bytes_in_chunks(
+                    buffer,
+                    services_pb2.Parameters,
+                    log_prefix="[LEARNER] Sending parameters",
+                    silent=True,
+                )
+            except Exception:
+                logging.info("[LEARNER] Failed to push parameters (actor likely gone), ending stream")
+                break
 
             last_push_time = time.time()
             logging.info("[LEARNER] Parameters sent")
 
-        logging.info("[LEARNER] Stream parameters finished")
+        logging.info("[LEARNER] Stream parameters finished (epoch=%s)", my_epoch)
         return services_pb2.Empty()
 
-    def SendTransitions(self, request_iterator, _context: "grpc.ServicerContext"):  # noqa: N802
+    def SendTransitions(self, request_iterator, context: "grpc.ServicerContext"):  # noqa: N802
         # TODO: authorize the request
         logging.info("[LEARNER] Received request to receive transitions from the Actor")
 
@@ -117,7 +149,7 @@ class LearnerService(_ServicerBase):
         logging.debug("[LEARNER] Finished receiving transitions")
         return services_pb2.Empty()
 
-    def SendInteractions(self, request_iterator, _context: "grpc.ServicerContext"):  # noqa: N802
+    def SendInteractions(self, request_iterator, context: "grpc.ServicerContext"):  # noqa: N802
         # TODO: authorize the request
         logging.info("[LEARNER] Received request to receive interactions from the Actor")
 

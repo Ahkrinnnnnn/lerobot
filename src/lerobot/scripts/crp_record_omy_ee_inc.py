@@ -13,44 +13,50 @@
 # limitations under the License.
 
 """
-Record a LeRobot dataset while teleoperating a CRP arm from an OMY_L100 master using **incremental GP**
-commands from ROS **end-effector xyz** (no joint-angle mapping to CRP).
+Record a LeRobot dataset: OMY_L100 teleop → CRP arm via **incremental GP** from ROS EE xyz
+(no joint-angle mapping to CRP).
 
-Control (episode-relative incremental; **OMY EE xyz uses the same frame as CRP**, no kinematics):
-  ``crp_xyz = p0_crp + scaling_factor * ( xyz_now - xyz_ref )`` with fixed
-  roll/pitch/yaw ``-180°, 0°, 0°``.  OMY EE xyz (after ``ros_ee_pose_position_scale``) comes from
-  ``OMYL100.get_ros_end_effector_xyz_rpy_deg()`` — same ``PoseStamped`` subscription as the teleop node
-  (``OMYL100Config.ros_end_effector_pose_topic``; empty uses ``OMY_L100.EE_STATES_TOPIC``).
-  No separate EE ROS process in this script.  Main process waits without timeout for the first non-``None`` EE
-  reading before starting the GP stream.  Arm commands use ``send_GPs`` only.
+Control (episode-relative; OMY EE xyz and CRP share the same frame):
+  ``crp_xyz = p0 + scale * step_sizes * (omy_now - omy_ref)``; rpy held at latched CRP pose.
 
-Gripper: unchanged — ``sensor_msgs/JointState`` + ``ros_gripper_joint_name`` → ``set_GOT`` /
-dataset ``gripper.pos`` via ``_omy_rh_r1_to_got0``.
+Process layout (CRP Thrift is not safe to share — fork owns SDK during the stream):
+  - **spawn**: ROS EE→``latest_gp6`` @stream Hz; gripper via ``get_gripper_raw``→GOT
+    (processors/display ~30Hz only).
+  - **fork**: ``set_GPs`` @stream Hz; ``set_GOT`` **only when value changes** (dedup).
+  - **parent**: cameras + ``add_frame`` at dataset fps; no CRP SDK while fork lives.
 
-Multiprocessing: a ``spawn`` worker owns ROS + polls EE / gripper at ``CRP_GP_STREAM_HZ``; a ``fork`` worker runs ``send_GPs`` + ``set_GOT`` at the same cadence so **camera / dataset fps does not throttle** arm commands. Main loop only copies ``omy_display_action`` for processors / logging.
+Gripper timing (smooth checkpoint):
+  - Until armed: no ``set_GOT``.
+  - At arm: parent writes held/seed GOT once, then starts fork (dedup seeded to that value).
+  - After ``omy_gp_armed``: spawn updates GOT buffer from ``get_gripper_raw``; ignore
+    OMY until |ΔGOT| ≥ ``GOT_FOLLOW_DELTA`` vs seed (avoid re-arm snap-shut).
+  - Fork never spams unchanged GOT next to ``set_GPs``.
 
-Other teleops (non-OMY): GP command from ``ee.x`` … ``ee.yaw`` in the processed action dict, assumed already in the CRP frame (pass-through, no transform).
 
-Prerequisites:
-  - OMY publishes ``JointState`` and (for arm GP) ``PoseStamped`` (see ``OMYL100Config.ros_end_effector_pose_topic``).
-  - ``third_party/CrpRobotPy`` on disk; the CRP arm driver loads it lazily on first robot connect.
+Dataset labeling (OMY commands EE+gripper; joints are measured on the CRP):
+  - ``action.ee`` / gripper: current command (``latest_gp6`` / GOT).
+  - ``obs.joint``: measured ``read_joints`` at frame t (fork samples ~dataset fps).
+  - ``action.joint``: measured joints at frame t+1 (next-state target). The final
+    camera/obs tick is dropped (no next joint) — last transition still uses that
+    last measurement as ``action.joint`` of the previous row.
+  - ``obs.ee`` / ``obs.gripper``: previous frame's action (1-frame delayed command).
+    Do **not** sample ``read_end_pose`` while streaming — that starved GP / froze EE before.
 
-Example:
+Arming:
+  1. Spawn waits for stable EE, latches ``omy_ref``, signals ready (no deltas yet).
+  2. Parent preloads GP, ``ensure_gp_mode``, GI56 ON, **starts fork** (streams init pose).
+  3. Then ``omy_gp_armed`` — spawn re-latches ``omy_ref`` (opening delta=0) and starts deltas.
+  Until armed: no GP/GJ/GOT/GI→GP; GI56 stays off.
 
-```shell
-python -m lerobot.scripts.crp_record_omy_ee_inc \\
-    --robot.type=crp_arm \\
-    --robot.port=/dev/ttyUSB0 \\
-    --robot.cameras='{wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}' \\
-    --teleop.type=OMY_L100 \\
-    --teleop.port=dummy \\
-    --dataset.repo_id=<user>/crp_omy_ee_inc \\
-    --dataset.num_episodes=10 \\
-    --dataset.single_task="Pick and place" \\
-    --display_data=false
-```
+Teardown: stop spawn/fork first, then GI56 OFF; keep last GP. Never write GI while fork owns SDK.
 
-Note: ``--teleop.port`` is required by the config schema but unused by OMY (connection is ROS-based).
+Between episodes: ``reset_teleop=false`` (default) hold still for manual reset;
+  ``true`` re-arms OMY teleop during the reset phase.
+
+Helpers: ``lerobot.robots.crp_arm.ee_gp``. Gripper: JointState → GOT0 / ``gripper.pos``.
+
+Example: ``python -m lerobot.scripts.crp_record_omy_ee_inc --config_path=examples/hilserl/record/crp_omy_record.json``
+(``--teleop.port`` is required by schema but unused; OMY is ROS-based).
 """
 
 # TrajectoryProcessor lives in lerobot.tools.TrajProcessor (file TrajProcessor.py);
@@ -58,13 +64,12 @@ Note: ``--teleop.port`` is required by the config schema but unused by OMY (conn
 from lerobot.tools import TrajectoryProcessor
 
 import logging
-import math
 import multiprocessing
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Sequence
+from typing import Any
 
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
@@ -74,7 +79,6 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts, hw_to_dataset_features
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -109,7 +113,21 @@ from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 
 # Import CRPArm after ROS teleop imports; native SDK loads lazily on first robot connect.
 from lerobot.robots.crp_arm import CRPArm
-from lerobot.utils.control_utils import (
+from lerobot.robots.crp_arm.ee_gp import (
+    DEFAULT_EE_STEP_SIZES,
+    DEFAULT_GP_STREAM_HZ,
+    EE_OMY_DELTA_SCALE,
+    GP_GROUP_SIZE,
+    ee_action_to_crp_endpose_list,
+    log_gp_points_matrix,
+    omy_relative_xyz_to_gp6,
+    omy_rh_r1_to_got0,
+    resolve_ee_delta_scale,
+    resolve_ee_step_sizes,
+    send_gp_endpose6,
+    wait_stable_omy_ee_xyz,
+)
+from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     predict_action,
@@ -117,12 +135,10 @@ from lerobot.utils.control_utils import (
     sanity_check_dataset_robot_compatibility,
 )
 from lerobot.utils.constants import ACTION
+from lerobot.utils.device_utils import get_safe_torch_device
+from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts, hw_to_dataset_features
 from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.utils import (
-    get_safe_torch_device,
-    init_logging,
-    log_say,
-)
+from lerobot.utils.utils import init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
@@ -136,14 +152,70 @@ def _omy_spawn_context() -> "multiprocessing.context.BaseContext":
     return multiprocessing.get_context("spawn")
 
 
+# Recording-only log throttle for spawn / fork debug lines.
+CRP_EE_SPAWN_LOG_INTERVAL_S = 0.5
+
+# After arm / re-arm: hold commanded GOT until OMY gripper moves by this much (GOT units).
+# Prevents snap-shut when the master spring returns near closed at episode start.
+GOT_FOLLOW_DELTA = 40
+
+# ANSI colors for terminal readiness cues (no CRP LED API in CrpRobotPy bindings).
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD_RED = "\033[1;91m"
+_ANSI_BOLD_YELLOW = "\033[1;93m"
+
+
+_ANSI_BOLD_CYAN = "\033[1;96m"
+
+
+def _print_ee_wait_stage(msg: str, *, color: str = _ANSI_BOLD_YELLOW) -> None:
+    """Stage cue during EE wait (not yet safe to teleop)."""
+    print(f"{color}{msg}{_ANSI_RESET}", flush=True)
+
+
+def _print_teleop_ready_banner(*, phase: str = "record", reset_teleop: bool = False) -> None:
+    """Loud cue for record (GP armed) or reset (manual hold / optional teleop)."""
+    line = "=" * 72
+    if phase == "reset":
+        if reset_teleop:
+            print(
+                f"{_ANSI_BOLD_CYAN}{line}\n"
+                f"  ◆ 复位阶段遥操就绪（用 OMY 摆场景 / 回位，本段不写入 episode）\n"
+                f"  reset_teleop=true：臂+夹爪跟随 OMY。右键结束复位→save_episode。\n"
+                f"{line}{_ANSI_RESET}",
+                flush=True,
+            )
+        else:
+            print(
+                f"{_ANSI_BOLD_CYAN}{line}\n"
+                f"  ◆ 复位阶段：机械臂保持不动（reset_teleop=false，手动复原）\n"
+                f"  不遥操臂/夹爪；本段不写入 episode。右键结束复位→save_episode。\n"
+                f"{line}{_ANSI_RESET}",
+                flush=True,
+            )
+        return
+    print(
+        f"{_ANSI_BOLD_RED}{line}\n"
+        f"  ★★★  录制阶段 EE→GP 已就绪：可以开始遥操（动 OMY）  ★★★\n"
+        f"  右键=结束本段→复位→写盘；左键=结束本段→复位→清空缓冲重录。\n"
+        f"{line}{_ANSI_RESET}",
+        flush=True,
+    )
+
+
 def _spawn_omy_ee_gp_action_worker(
     *,
     teleop_cfg: dict[str, Any],
     omy_action_stop: Any,
+    omy_stream_ready: Any,
+    omy_gp_armed: Any,
     gp_cmd_lock: Any,
     latest_gp6: Any,
     shared_p0: Any,
     shared_omy_ref: Any,
+    shared_hold_rpy: Any,
+    step_sizes: dict[str, float],
+    delta_scale: float,
     latest_obs_for_action_lock: Any,
     latest_obs_for_action: Any,
     omy_display_action_lock: Any,
@@ -152,7 +224,7 @@ def _spawn_omy_ee_gp_action_worker(
     latest_got0_holder: Any,
     ros_gripper_joint_name: str,
 ) -> None:
-    """``spawn`` process: ROS node + EE incremental GP targets + gripper GOT0 into Manager buffers."""
+    """``spawn`` process: ROS + EE→GP into shared-memory buffers (Array/Lock)."""
     import os
 
     import rclpy as _rclpy
@@ -170,80 +242,139 @@ def _spawn_omy_ee_gp_action_worker(
     teleop_action_processor, robot_action_processor, _unused_obs = make_default_processors()
     teleop: OMYL100 | None = None
     _ee_dbg_last = [0.0]
+    _log = logging.getLogger(__name__)
+    resolved_steps = resolve_ee_step_sizes(step_sizes)
+    scale = resolve_ee_delta_scale(delta_scale)
     try:
         cfg = OMYL100Config(**teleop_cfg)
         teleop = OMYL100(cfg)
         teleop.connect()
-        period = 1.0 / CRP_GP_STREAM_HZ
+
+        # Stabilize EE in this process before any delta GP; then signal parent to arm CRP GP mode.
+        # Do not overwrite parent-seeded GOT here (held across episodes until arm).
+        ref_xyz = wait_stable_omy_ee_xyz(
+            teleop.get_ros_end_effector_xyz_rpy_deg,
+            stop_fn=omy_action_stop.is_set,
+            log_prefix="OMY EE spawn stable",
+        )
+        for _i in range(3):
+            shared_omy_ref[_i] = float(ref_xyz[_i])
+        omy_stream_ready.set()
+        _log.info(
+            "OMY EE spawn: ref ready omy_ref=%s step_sizes=%s scale=%.2f — "
+            "waiting for parent omy_gp_armed (no delta until then)",
+            ref_xyz,
+            resolved_steps,
+            scale,
+        )
+        while not omy_action_stop.is_set() and not omy_gp_armed.wait(timeout=0.5):
+            pass
+        if omy_action_stop.is_set():
+            return
+        # Re-latch omy_ref at arm time (parent may have spent time preloading / starting
+        # fork). Opening delta must be 0 — otherwise the first GP jump feels steep.
+        _arm_ee = teleop.get_ros_end_effector_xyz_rpy_deg()
+        if _arm_ee is not None:
+            for _i in range(3):
+                shared_omy_ref[_i] = float(_arm_ee[0][_i])
+            p0_hold = [float(shared_p0[i]) for i in range(3)] + [
+                float(shared_hold_rpy[i]) for i in range(3)
+            ]
+            with gp_cmd_lock:
+                for _i in range(6):
+                    latest_gp6[_i] = p0_hold[_i]
+            _log.info(
+                "OMY EE spawn: omy_gp_armed — re-latched omy_ref=%s (delta0); starting EE→GP",
+                [float(_arm_ee[0][i]) for i in range(3)],
+            )
+        else:
+            _log.info("OMY EE spawn: omy_gp_armed — starting EE→GP deltas (no EE for re-latch)")
+
+        # Hot path @stream Hz (smooth checkpoint): EE→GP + raw gripper→GOT only.
+        # Processors / Manager display ~30Hz — 100Hz Manager+processor stuttered GP,
+        # especially while GOT was changing during grasp.
+        period = 1.0 / DEFAULT_GP_STREAM_HZ
+        display_every = max(1, int(round(DEFAULT_GP_STREAM_HZ / 30.0)))
         t_next = time.perf_counter()
+        _none_streak = 0
+        tick = 0
+        # Hold seed GOT until OMY moves enough (same as re-arm snap-shut guard).
+        _grip_seed: int | None = None
+        if gripper_got_lock is not None and latest_got0_holder is not None:
+            with gripper_got_lock:
+                _grip_seed = int(latest_got0_holder[0])
         while not omy_action_stop.is_set():
-            act = teleop.get_action()
-
-            obs_for_action: RobotObservation = {}
-            if latest_obs_for_action_lock is not None and latest_obs_for_action is not None:
-                with latest_obs_for_action_lock:
-                    obs_for_action = dict(latest_obs_for_action.copy())
-
-            act_processed = teleop_action_processor((act, obs_for_action))
-            robot_action_to_send_tamp = robot_action_processor((act_processed, obs_for_action))
-
             ee_pair = teleop.get_ros_end_effector_xyz_rpy_deg()
-            if ee_pair is not None:
+            if ee_pair is None:
+                _none_streak += 1
+                if _none_streak in (1, 50, 200) or _none_streak % 500 == 0:
+                    _log.warning(
+                        "OMY EE spawn: get_ros_end_effector_xyz_rpy_deg() is None "
+                        "(streak=%d) — CRP GP held at last cmd (arm looks frozen)",
+                        _none_streak,
+                    )
+            else:
+                _none_streak = 0
                 omy_now = [float(ee_pair[0][i]) for i in range(3)]
                 p0 = [float(shared_p0[i]) for i in range(3)]
                 ref = [float(shared_omy_ref[i]) for i in range(3)]
-                d = [CRP_EE_OMY_DELTA_SCALE * (float(omy_now[i]) - ref[i]) for i in range(3)]
-                gp6 = [
-                    p0[0] + d[0],
-                    p0[1] + d[1],
-                    p0[2] + d[2],
-                    CRP_EE_FIXED_ROLL_DEG,
-                    CRP_EE_FIXED_PITCH_DEG,
-                    CRP_EE_FIXED_YAW_DEG,
-                ]
+                hold = [float(shared_hold_rpy[i]) for i in range(3)]
+                gp6 = omy_relative_xyz_to_gp6(
+                    p0,
+                    omy_now,
+                    ref,
+                    hold_rpy=hold,
+                    step_sizes=resolved_steps,
+                    scale=scale,
+                )
                 with gp_cmd_lock:
-                    # Avoid ``latest_gp6[:] = gp6`` on ``Manager().list`` — slice assign can fail to sync
-                    # reliably across processes; fork GP sender would then repeat the initial pose forever.
                     for _i in range(6):
-                        latest_gp6[_i] = gp6[_i]
+                        latest_gp6[_i] = float(gp6[_i])
                 _now_m = time.monotonic()
                 if _now_m - _ee_dbg_last[0] >= CRP_EE_SPAWN_LOG_INTERVAL_S:
                     _ee_dbg_last[0] = _now_m
-                    _gt = None
-                    if gripper_got_lock is not None and latest_got0_holder is not None:
-                        with gripper_got_lock:
-                            _gt = int(latest_got0_holder[0])
-                    logging.getLogger(__name__).info(
-                        "OMY EE→CRP (spawn): omy_xyz_scaled=%.4f %.4f %.4f ref=%.4f %.4f %.4f "
-                        "delta=%.4f %.4f %.4f gp6=[%.4f %.4f %.4f %.2f %.2f %.2f] got0_target=%s",
+                    d = [gp6[i] - p0[i] for i in range(3)]
+                    _log.info(
+                        "OMY EE→CRP (spawn): omy=%.3f %.3f %.3f delta=%.3f %.3f %.3f gp=%.3f %.3f %.3f",
                         omy_now[0],
                         omy_now[1],
                         omy_now[2],
-                        ref[0],
-                        ref[1],
-                        ref[2],
                         d[0],
                         d[1],
                         d[2],
                         gp6[0],
                         gp6[1],
                         gp6[2],
-                        gp6[3],
-                        gp6[4],
-                        gp6[5],
-                        _gt,
                     )
 
+            # Gripper: get_gripper_raw → GOT (bypass processors on the 100Hz path).
             if ros_gripper_joint_name:
-                got0 = _omy_rh_r1_to_got0(float(robot_action_to_send_tamp.get("gripper.pos", 0.0)))
+                if hasattr(teleop, "get_gripper_raw"):
+                    raw_g = float(teleop.get_gripper_raw())
+                else:
+                    raw_g = float(teleop.get_action().get("gripper.pos", 0.0))
+                got0 = int(omy_rh_r1_to_got0(raw_g))
+                if _grip_seed is not None and abs(got0 - _grip_seed) < GOT_FOLLOW_DELTA:
+                    got0 = _grip_seed
+                else:
+                    _grip_seed = None
                 if gripper_got_lock is not None and latest_got0_holder is not None:
                     with gripper_got_lock:
                         latest_got0_holder[0] = got0
 
-            if omy_display_action_lock is not None and omy_display_action is not None:
-                with omy_display_action_lock:
-                    omy_display_action.clear()
-                    omy_display_action.update(act_processed)
+            tick += 1
+            if tick % display_every == 0:
+                act = teleop.get_action()
+                obs_for_action: RobotObservation = {}
+                if latest_obs_for_action_lock is not None and latest_obs_for_action is not None:
+                    with latest_obs_for_action_lock:
+                        obs_for_action = dict(latest_obs_for_action.copy())
+                act_processed = teleop_action_processor((act, obs_for_action))
+                _ = robot_action_processor((act_processed, obs_for_action))
+                if omy_display_action_lock is not None and omy_display_action is not None:
+                    with omy_display_action_lock:
+                        omy_display_action.clear()
+                        omy_display_action.update(act_processed)
 
             t_next += period
             dt = t_next - time.perf_counter()
@@ -258,93 +389,6 @@ def _spawn_omy_ee_gp_action_worker(
                 teleop.disconnect()
             except Exception:
                 logging.getLogger(__name__).exception("OMY EE spawn worker disconnect failed")
-
-
-# EE/GP streaming cadence (spawn worker poll + fork sender); decoupled from dataset/camera fps.
-CRP_GP_STREAM_HZ = 100.0
-
-# Scale applied to OMY EE position **delta** (after ``ros_ee_pose_position_scale``), before adding to ``p0_crp``.
-CRP_EE_OMY_DELTA_SCALE = 1.0
-
-# Fixed CRP command orientation (deg), end-effector frame (same convention as ``read_end_pose_user``).
-CRP_EE_FIXED_ROLL_DEG = -180.0
-CRP_EE_FIXED_PITCH_DEG = 0.0
-CRP_EE_FIXED_YAW_DEG = 0.0
-
-# OMY ``rh_r1_joint`` gripper position → CRP GOT0 (0=closed, 1000=open): clip to [-15, 15], then linear map.
-OMY_GRIPPER_RH_R1_CLIP_LO = -15.0
-OMY_GRIPPER_RH_R1_CLIP_HI = 15.0
-CRP_GRIPPER_GOT0_MAX = 1000
-
-# ``init_matrix(..., group_size=5)`` is used at startup; the fork sender must match that shape.
-# Default ``TrajectoryProcessor`` has ``max_points=1``, so ``read_points()`` returns only **one** 6-vector row,
-# which many CRP ``set_GPs`` paths ignore — arm appears frozen. Always send 5 duplicate rows of the latest pose.
-CRP_GP_GROUP_SIZE = 5
-
-# Throttle INFO logs from the OMY EE spawn worker (computed delta / gp6 / gripper target).
-CRP_EE_SPAWN_LOG_INTERVAL_S = 0.5
-
-# Throttle ``send_GPs`` pose logs from ``_crp_send_gp_endpose6`` (fork sender ~ ``CRP_GP_STREAM_HZ``). Set to
-# ``None`` to log every tick (very verbose).
-CRP_GP_SEND_LOG_INTERVAL_S: float | None = 0.2
-_gp_send_log_last_mono: list[float] = [0.0]
-
-
-def _log_gp_vec6(msg: str, vec6: Sequence[float]) -> None:
-    """Log one 6-D endpose: xyz and rx/ry/rz in degrees (roll, pitch, yaw)."""
-    if len(vec6) < 6:
-        return
-    x, y, z, rx, ry, rz = (float(vec6[i]) for i in range(6))
-    logging.getLogger(__name__).info("%s xyz=(%.6f %.6f %.6f) rx_ry_rz_deg=(%.6f %.6f %.6f)", msg, x, y, z, rx, ry, rz)
-
-
-def _log_gp_vec6_throttled(msg: str, vec6: Sequence[float]) -> None:
-    if CRP_GP_SEND_LOG_INTERVAL_S is None:
-        _log_gp_vec6(msg, vec6)
-        return
-    now = time.monotonic()
-    if now - _gp_send_log_last_mono[0] < CRP_GP_SEND_LOG_INTERVAL_S:
-        return
-    _gp_send_log_last_mono[0] = now
-    _log_gp_vec6(msg, vec6)
-
-
-def _log_gp_points_matrix(msg: str, rows: list[list[float]]) -> None:
-    """Log GP matrix: row count and first row as xyz + rx/ry/rz (deg)."""
-    if not rows or len(rows[0]) < 6:
-        return
-    n = len(rows)
-    same = n > 1 and all(r == rows[0] for r in rows[1:])
-    suffix = f" ({n} duplicate rows)" if same and n > 1 else f" ({n} rows, logging first row)"
-    _log_gp_vec6(msg + suffix, rows[0])
-
-
-def _crp_send_gp_endpose6(robot: CRPArm, trajectory_processor: TrajectoryProcessor, vec6: list[float]) -> None:
-    """Send latest 6-D endpose as a ``CRP_GP_GROUP_SIZE``×6 GP matrix (same layout as startup ``init_matrix``)."""
-    mat = trajectory_processor.init_matrix([float(x) for x in vec6], group_size=CRP_GP_GROUP_SIZE)
-    _log_gp_vec6_throttled("send_GPs(10) before", vec6)
-    robot.send_GPs(10, mat)
-
-
-def _omy_rh_r1_to_got0(raw: float) -> int:
-    """Clamp OMY gripper joint value to [-15, 15], map linearly to GOT0 in [0, 1000]."""
-    raw = raw * 180 / 3.14
-    c = max(OMY_GRIPPER_RH_R1_CLIP_LO, min(OMY_GRIPPER_RH_R1_CLIP_HI, float(raw)))
-    span = OMY_GRIPPER_RH_R1_CLIP_HI - OMY_GRIPPER_RH_R1_CLIP_LO
-    v = float(CRP_GRIPPER_GOT0_MAX) * (c - OMY_GRIPPER_RH_R1_CLIP_LO) / span
-    return int(max(0, min(CRP_GRIPPER_GOT0_MAX, round(v))))
-
-
-def _ee_action_to_crp_endpose_list(action: dict[str, float]) -> list[float]:
-    """Build a 6-DOF GP vector from ``ee.*`` keys; no coordinate transform (same frame as CRP)."""
-    return [
-        float(action.get("ee.x", 0.0)),
-        float(action.get("ee.y", 0.0)),
-        float(action.get("ee.z", 0.0)),
-        float(action.get("ee.roll", 0.0)),
-        float(action.get("ee.pitch", 0.0)),
-        float(action.get("ee.yaw", 0.0)),
-    ]
 
 
 def _resolve_crp_read_joints_value(read_joints: dict[str, Any], motor: str) -> float:
@@ -381,6 +425,91 @@ def _action_values_for_dataset_from_crp_joints(
     return out
 
 
+_EE_ACTION_NAMES = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+
+
+def _action_values_for_dataset_from_gp6(gp6: list[float] | tuple[float, ...]) -> dict[str, float]:
+    """Map commanded GP pose6 → action keys (teleop command, not measured EE)."""
+    if len(gp6) < 6:
+        raise ValueError(f"gp6 needs 6 values, got {len(gp6)}")
+    return {name: float(gp6[i]) for i, name in enumerate(_EE_ACTION_NAMES)}
+
+
+def _joints_dict_from_shared6(joints6: Any) -> dict[str, float]:
+    """``Array('d', 6)`` / sequence → ``j1.pos``…``j6.pos``."""
+    return {f"j{i}.pos": float(joints6[i - 1]) for i in range(1, 7)}
+
+
+def _flush_pending_dataset_frame(
+    dataset: LeRobotDataset,
+    pending: dict[str, Any],
+    *,
+    joint_action: dict[str, float] | None,
+) -> None:
+    """Write a buffered frame; optional ``joint_action`` fills ``j*.pos`` (next-state target)."""
+    action_values = dict(pending["action_values"])
+    if joint_action:
+        action_values.update(joint_action)
+    action_frame = build_dataset_frame(dataset.features, action_values, prefix="action")
+    dataset.add_frame(
+        {
+            **pending["observation_frame"],
+            **action_frame,
+            "task": pending["task"],
+        }
+    )
+
+
+def _publish_stream_obs_cache(
+    robot: "CRPArm",
+    *,
+    prev: dict[str, float] | None,
+    measured_joints: dict[str, float] | None = None,
+) -> None:
+    """Parent-side cache publish (no SDK): measured joints + delayed EE/gripper command."""
+    snap: dict[str, float] = {}
+    if robot.config.enable_joint:
+        src = measured_joints if measured_joints is not None else prev
+        if src:
+            for i in range(1, 7):
+                key = f"j{i}.pos"
+                if key in src:
+                    snap[key] = float(src[key])
+    if prev is not None and robot.config.use_gripper_feature and "gripper.pos" in prev:
+        snap["gripper.pos"] = float(prev["gripper.pos"])
+    if snap:
+        robot.set_proprio_cache_snapshot(snap)
+    if prev is not None and robot.config.enable_ee and all(name in prev for name in _EE_ACTION_NAMES):
+        robot.update_ee_cache_from_pose6([float(prev[name]) for name in _EE_ACTION_NAMES])
+
+
+def _build_dataset_action_values(
+    dataset: LeRobotDataset,
+    *,
+    joint_snapshot: dict[str, Any] | None,
+    gp6: list[float] | tuple[float, ...] | None,
+    gripper_got0: float | None,
+) -> dict[str, float]:
+    """Fill action dict from joints and/or commanded GP according to ``dataset.features['action'].names``."""
+    names: list[str] = list((dataset.features.get("action") or {}).get("names") or [])
+    out: dict[str, float] = {}
+    if joint_snapshot is not None:
+        out.update(_action_values_for_dataset_from_crp_joints(dataset, joint_snapshot))
+    if gp6 is not None:
+        ee_vals = _action_values_for_dataset_from_gp6(gp6)
+        for name in names:
+            if name in ee_vals:
+                out[name] = ee_vals[name]
+        if not names:
+            out.update(ee_vals)
+    if gripper_got0 is not None and (not names or "gripper.pos" in names):
+        out["gripper.pos"] = float(gripper_got0)
+    # Drop keys not in the dataset action schema when names are known.
+    if names:
+        out = {n: float(out.get(n, 0.0)) for n in names}
+    return out
+
+
 @dataclass
 class DatasetRecordConfig:
     repo_id: str
@@ -413,8 +542,18 @@ class RecordConfig:
     display_data: bool = False
     play_sounds: bool = True
     resume: bool = False
+    # Between episodes: False = hold still (manual scene reset); True = re-arm OMY teleop.
+    reset_teleop: bool = False
+    speed_ratio: int = 80
+    ee_delta_scale: float = EE_OMY_DELTA_SCALE
+    ee_step_sizes: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_EE_STEP_SIZES)
+    )
 
     def __post_init__(self):
+        # Config / CLI values overlay code defaults (partial dicts keep missing axes at default).
+        self.ee_step_sizes = resolve_ee_step_sizes(self.ee_step_sizes)
+        self.ee_delta_scale = resolve_ee_delta_scale(self.ee_delta_scale)
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
@@ -452,9 +591,16 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     trajectory_processor: TrajectoryProcessor | None = None,
+    ee_step_sizes: dict[str, float] | None = None,
+    ee_delta_scale: float = 1.5,
+    phase: str = "record",
+    held_got0: list[int | None] | None = None,
+    reset_teleop: bool = False,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+    # Record always; reset only when reset_teleop=True.
+    omy_stream = phase != "reset" or reset_teleop
 
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
@@ -494,7 +640,7 @@ def record_loop(
     omy_display_action: RobotAction | None = None
     latest_obs_for_action_lock: Any = None
     latest_obs_for_action: RobotObservation | None = None
-    if isinstance(teleop, OMYL100) and policy is None:
+    if isinstance(teleop, OMYL100) and policy is None and omy_stream:
         mp_ctx = _record_multiprocessing_context()
         mp_manager = mp_ctx.Manager()
         omy_action_stop = mp_manager.Event()
@@ -506,186 +652,335 @@ def record_loop(
     timestamp = 0
     start_episode_t = time.perf_counter()
 
-    # Dedup ``set_GOT`` in the fork GP sender (and fallback main-thread path).
-    last_got0_sent = [-10**9]
-
     gp_sender_stop: Any = None
     gp_sender_process: Any = None
     gp_cmd_lock: Any = None
     latest_gp6: Any = None
     latest_got0_holder: list[int] | Any | None = None
     gripper_got_lock: Any = None
-
-    # Episode-local incremental EE state (OMY ROS xyz → CRP GP); copied into Manager lists for spawn worker.
+    # EE/gripper obs = previous action; joints = fork-measured shared buffer when enabled.
+    prev_action_for_obs: dict[str, float] | None = None
+    latest_joints6: Any = None
+    # When enable_joint: delay add_frame 1 tick so action.joint = next measured joints.
+    pending_dataset_frame: dict[str, Any] | None = None
     p0_crp: tuple[float, float, float] | None = None
     omy_ref_xyz: list[float] | None = None
 
-    # Initialize GP registers on the CRP controller.
-    if trajectory_processor is not None:
-        if isinstance(teleop, OMYL100) and isinstance(robot, CRPArm) and policy is None:
-            if mp_ctx is None or mp_manager is None:
-                raise RuntimeError("OMY multiprocess workers require a multiprocessing context.")
-            p0 = robot.get_current_endpose()
-            p0_crp = (float(p0[0]), float(p0[1]), float(p0[2]))
-            _log = logging.getLogger(__name__)
-            _log.info(
-                "CRP initial endpose p0: xyz=(%.6f %.6f %.6f) rx_ry_rz_deg=(%.6f %.6f %.6f) "
-                "(p0_crp = this xyz, used as incremental GP position origin)",
-                float(p0[0]),
-                float(p0[1]),
-                float(p0[2]),
-                float(p0[3]),
-                float(p0[4]),
-                float(p0[5]),
-            )
-            _cfg_ee = (getattr(teleop.config, "ros_end_effector_pose_topic", "") or "").strip()
-            _resolved_ee_topic = _cfg_ee or EE_STATES_TOPIC
-            _log.info(
-                "EE wait [1/4] Entering OMY EE init: p0_crp=%s teleop.is_connected=%s "
-                "ros_end_effector_pose_topic config=%r → effective PoseStamped topic=%r",
-                p0_crp,
-                getattr(teleop, "is_connected", None),
-                getattr(teleop.config, "ros_end_effector_pose_topic", ""),
-                _resolved_ee_topic,
-            )
-            _log.info(
-                "EE wait [2/4] Blocking until get_ros_end_effector_xyz_rpy_deg() is not None "
-                "(ROS must deliver first PoseStamped on %r; spin thread must be running).",
-                _resolved_ee_topic,
-            )
-            _wait_t0 = time.perf_counter()
-            _last_stall_log = _wait_t0
-            _stall_iv = 2.0
-            _iter = 0
-            while teleop.get_ros_end_effector_xyz_rpy_deg() is None:
-                _iter += 1
-                _now = time.perf_counter()
-                if _now - _last_stall_log >= _stall_iv:
-                    _last_stall_log = _now
-                    _ga = teleop.get_action()
-                    _log.warning(
-                        "EE wait [2/4] still blocked after %.1fs (iter≈%d): get_ros_end_effector_xyz_rpy_deg() "
-                        "is still None. Check: (1) publisher on %r + QoS vs subscriber depth=10 "
-                        "(2) ROS_DOMAIN_ID (3) joint_states OK? j1.pos=%.4f teleop.is_connected=%s",
-                        _now - _wait_t0,
-                        _iter,
-                        _resolved_ee_topic,
-                        float(_ga.get("j1.pos", 0.0)),
-                        getattr(teleop, "is_connected", None),
-                    )
-                time.sleep(0.01)
-            _dt_wait = time.perf_counter() - _wait_t0
-            _log.info(
-                "EE wait [3/4] First non-None EE after %.3fs (%d wait-loop iterations).",
-                _dt_wait,
-                _iter,
-            )
-            _ee0 = teleop.get_ros_end_effector_xyz_rpy_deg()
-            assert _ee0 is not None
-            omy_ref_xyz = [float(_ee0[0][0]), float(_ee0[0][1]), float(_ee0[0][2])]
-            _log.info(
-                "EE wait [4/4] First OMY EE scaled xyz=%s — starting GP stream (shared_omy_ref / send_GPs).",
-                omy_ref_xyz,
-            )
-            init_pose = [
-                p0_crp[0],
-                p0_crp[1],
-                p0_crp[2],
-                CRP_EE_FIXED_ROLL_DEG,
-                CRP_EE_FIXED_PITCH_DEG,
-                CRP_EE_FIXED_YAW_DEG,
-            ]
-            shared_p0 = mp_manager.list([p0_crp[0], p0_crp[1], p0_crp[2]])
-            shared_omy_ref = mp_manager.list([omy_ref_xyz[0], omy_ref_xyz[1], omy_ref_xyz[2]])
-            gp_cmd_lock = mp_manager.Lock()
-            latest_gp6 = mp_manager.list(list(init_pose))
-            init_matrix = trajectory_processor.init_matrix(init_pose, group_size=CRP_GP_GROUP_SIZE)
-            _log_gp_points_matrix("send_GPs init OMY reg10/20 before", init_matrix)
-            robot.send_GPs(10, init_matrix)
-            robot.send_GPs(20, init_matrix)
-            _grip_name = str(getattr(teleop.config, "ros_gripper_joint_name", "") or "")
-            if _grip_name:
-                latest_got0_holder = mp_manager.list([0])
-                gripper_got_lock = mp_manager.Lock()
-                init_grip = float(teleop.get_action().get("gripper.pos", 0.0))
-                _init_got = _omy_rh_r1_to_got0(init_grip)
-                robot.set_GOT(0, _init_got)
-                latest_got0_holder[0] = _init_got
-                last_got0_sent[0] = _init_got
-            gp_sender_stop = mp_ctx.Event()
-            _gp_fork_log_last = [0.0]
-
-            def _fixed_rate_gp_sender() -> None:
-                period = 1.0 / CRP_GP_STREAM_HZ
-                t_next = time.perf_counter()
-                assert latest_gp6 is not None
-                assert gp_cmd_lock is not None
-                assert gp_sender_stop is not None
-                _log = logging.getLogger(__name__)
-                while not gp_sender_stop.is_set():
-                    with gp_cmd_lock:
-                        vec = list(latest_gp6)
-                    _crp_send_gp_endpose6(robot, trajectory_processor, vec)
-                    got_sent = None
-                    if gripper_got_lock is not None and latest_got0_holder is not None:
-                        with gripper_got_lock:
-                            got_sent = int(latest_got0_holder[0])
-                        robot.set_GOT(0, got_sent)
-                    _tn = time.monotonic()
-                    if _tn - _gp_fork_log_last[0] >= CRP_EE_SPAWN_LOG_INTERVAL_S:
-                        _gp_fork_log_last[0] = _tn
-                        _log.info(
-                            "CRP GP fork sent: vec6=%s rows=%d got0=%s",
-                            vec,
-                            CRP_GP_GROUP_SIZE,
-                            got_sent,
-                        )
-                    t_next += period
-                    dt = t_next - time.perf_counter()
-                    if dt > 0:
-                        precise_sleep(dt)
-                    else:
-                        t_next = time.perf_counter()
-
-            gp_sender_process = mp_ctx.Process(target=_fixed_rate_gp_sender, name="crp_gp_sender", daemon=True)
-            gp_sender_process.start()
-
-            assert omy_action_stop is not None
-            omy_spawn_ctx = _omy_spawn_context()
-            omy_action_update_process = omy_spawn_ctx.Process(
-                target=_spawn_omy_ee_gp_action_worker,
-                name="omy_ee_gp_update",
-                daemon=True,
-                kwargs={
-                    "teleop_cfg": asdict(teleop.config),
-                    "omy_action_stop": omy_action_stop,
-                    "gp_cmd_lock": gp_cmd_lock,
-                    "latest_gp6": latest_gp6,
-                    "shared_p0": shared_p0,
-                    "shared_omy_ref": shared_omy_ref,
-                    "latest_obs_for_action_lock": latest_obs_for_action_lock,
-                    "latest_obs_for_action": latest_obs_for_action,
-                    "omy_display_action_lock": omy_display_action_lock,
-                    "omy_display_action": omy_display_action,
-                    "gripper_got_lock": gripper_got_lock,
-                    "latest_got0_holder": latest_got0_holder,
-                    "ros_gripper_joint_name": _grip_name,
-                },
-            )
-            omy_action_update_process.start()
-        else:
-            init_matrix = trajectory_processor.init_matrix(robot.get_current_endpose(), group_size=CRP_GP_GROUP_SIZE)
-            _log_gp_points_matrix("send_GPs init non-OMY reg10/20 before", init_matrix)
-            robot.send_GPs(10, init_matrix)
-            robot.send_GPs(20, init_matrix)
-
+    # GP/OMY init + main loop share one try/finally so Ctrl+C still stops workers.
     try:
+        if phase == "reset" and not reset_teleop:
+            _print_teleop_ready_banner(phase="reset", reset_teleop=False)
+        elif trajectory_processor is not None:
+            if isinstance(teleop, OMYL100) and isinstance(robot, CRPArm) and policy is None and omy_stream:
+                if mp_ctx is None or mp_manager is None:
+                    raise RuntimeError("OMY multiprocess workers require a multiprocessing context.")
+                # Until GP armed: no send_GPs / send_GJs / set_GOT / GI→GP (GI56 stays off).
+                if hasattr(robot, "wait_controller_ready"):
+                    robot.wait_controller_ready(timeout_s=1.5)
+                p0 = robot.get_current_endpose()
+                p0_crp = (float(p0[0]), float(p0[1]), float(p0[2]))
+                _log = logging.getLogger(__name__)
+                _log.info(
+                    "CRP initial endpose p0: xyz=(%.6f %.6f %.6f) rx_ry_rz_deg=(%.6f %.6f %.6f) "
+                    "(p0_crp = this xyz, used as incremental GP position origin)",
+                    float(p0[0]),
+                    float(p0[1]),
+                    float(p0[2]),
+                    float(p0[3]),
+                    float(p0[4]),
+                    float(p0[5]),
+                )
+                _cfg_ee = (getattr(teleop.config, "ros_end_effector_pose_topic", "") or "").strip()
+                _resolved_ee_topic = _cfg_ee or EE_STATES_TOPIC
+                _log.info(
+                    "EE wait [1/4] Entering OMY EE init: p0_crp=%s teleop.is_connected=%s "
+                    "ros_end_effector_pose_topic config=%r → effective PoseStamped topic=%r",
+                    p0_crp,
+                    getattr(teleop, "is_connected", None),
+                    getattr(teleop.config, "ros_end_effector_pose_topic", ""),
+                    _resolved_ee_topic,
+                )
+                _log.info(
+                    "EE wait [2/4] Blocking until get_ros_end_effector_xyz_rpy_deg() is not None "
+                    "(ROS must deliver first PoseStamped on %r; spin thread must be running).",
+                    _resolved_ee_topic,
+                )
+                _wait_t0 = time.perf_counter()
+                _last_stall_log = _wait_t0
+                _stall_iv = 2.0
+                _iter = 0
+                while teleop.get_ros_end_effector_xyz_rpy_deg() is None:
+                    _iter += 1
+                    _now = time.perf_counter()
+                    if _now - _last_stall_log >= _stall_iv:
+                        _last_stall_log = _now
+                        _ga = teleop.get_action()
+                        _log.warning(
+                            "EE wait [2/4] still blocked after %.1fs (iter≈%d): get_ros_end_effector_xyz_rpy_deg() "
+                            "is still None. Check: (1) publisher on %r + QoS vs subscriber depth=10 "
+                            "(2) ROS_DOMAIN_ID (3) joint_states OK? j1.pos=%.4f teleop.is_connected=%s",
+                            _now - _wait_t0,
+                            _iter,
+                            _resolved_ee_topic,
+                            float(_ga.get("j1.pos", 0.0)),
+                            getattr(teleop, "is_connected", None),
+                        )
+                    time.sleep(0.01)
+                _dt_wait = time.perf_counter() - _wait_t0
+                _log.info(
+                    "EE wait [3/4] First non-None EE after %.3fs (%d wait-loop iterations); "
+                    "now waiting for stable EE window.",
+                    _dt_wait,
+                    _iter,
+                )
+                omy_ref_xyz = wait_stable_omy_ee_xyz(
+                    teleop.get_ros_end_effector_xyz_rpy_deg,
+                    log_prefix="OMY EE parent stable",
+                )
+                # Re-read CRP pose after OMY is stable so p0/hold match the true start.
+                p0 = robot.get_current_endpose()
+                p0_crp = (float(p0[0]), float(p0[1]), float(p0[2]))
+                hold_rpy = (float(p0[3]), float(p0[4]), float(p0[5]))
+                _log.info(
+                    "EE wait [4/4] Stable parent omy_ref=%s; refreshed p0 xyz=(%.4f %.4f %.4f) "
+                    "hold_rpy=(%.4f %.4f %.4f) — starting spawn (no send_GPs / no GI=GP until armed)",
+                    omy_ref_xyz,
+                    p0_crp[0],
+                    p0_crp[1],
+                    p0_crp[2],
+                    *hold_rpy,
+                )
+                _print_ee_wait_stage(
+                    "[EE GP] 4/4 父进程 EE 已稳 — 仍在等 spawn 稳定 + GP arm，先别动手"
+                )
+                init_pose = [
+                    p0_crp[0],
+                    p0_crp[1],
+                    p0_crp[2],
+                    hold_rpy[0],
+                    hold_rpy[1],
+                    hold_rpy[2],
+                ]
+                # Hot-path GP/GOT: shared-memory Array/Lock — NOT Manager.list (100Hz proxy stutter).
+                # Must be created with the **spawn** context: these objects are pickled into the
+                # OMY spawn worker. Default/fork SemLock cannot be shared into spawn.
+                # The later fork GP sender inherits the same mappings from the parent.
+                omy_spawn_ctx = _omy_spawn_context()
+                shared_p0 = omy_spawn_ctx.Array("d", [p0_crp[0], p0_crp[1], p0_crp[2]], lock=False)
+                shared_omy_ref = omy_spawn_ctx.Array(
+                    "d", [omy_ref_xyz[0], omy_ref_xyz[1], omy_ref_xyz[2]], lock=False
+                )
+                shared_hold_rpy = omy_spawn_ctx.Array(
+                    "d", [hold_rpy[0], hold_rpy[1], hold_rpy[2]], lock=False
+                )
+                omy_stream_ready = mp_manager.Event()
+                omy_gp_armed = mp_manager.Event()
+                gp_cmd_lock = omy_spawn_ctx.Lock()
+                latest_gp6 = omy_spawn_ctx.Array("d", list(init_pose), lock=False)
+                _grip_name = str(getattr(teleop.config, "ros_gripper_joint_name", "") or "")
+                if _grip_name:
+                    latest_got0_holder = omy_spawn_ctx.Array("i", [0], lock=False)
+                    gripper_got_lock = omy_spawn_ctx.Lock()
+                    if held_got0 is not None and held_got0[0] is not None:
+                        latest_got0_holder[0] = int(held_got0[0])
+                    else:
+                        init_grip = float(teleop.get_action().get("gripper.pos", 0.0))
+                        latest_got0_holder[0] = int(omy_rh_r1_to_got0(init_grip))
+
+                assert omy_action_stop is not None
+                _steps = resolve_ee_step_sizes(ee_step_sizes)
+                _scale = resolve_ee_delta_scale(ee_delta_scale)
+                omy_action_update_process = omy_spawn_ctx.Process(
+                    target=_spawn_omy_ee_gp_action_worker,
+                    name="omy_ee_gp_update",
+                    daemon=True,
+                    kwargs={
+                        "teleop_cfg": asdict(teleop.config),
+                        "omy_action_stop": omy_action_stop,
+                        "omy_stream_ready": omy_stream_ready,
+                        "omy_gp_armed": omy_gp_armed,
+                        "gp_cmd_lock": gp_cmd_lock,
+                        "latest_gp6": latest_gp6,
+                        "shared_p0": shared_p0,
+                        "shared_omy_ref": shared_omy_ref,
+                        "shared_hold_rpy": shared_hold_rpy,
+                        "step_sizes": _steps,
+                        "delta_scale": _scale,
+                        "latest_obs_for_action_lock": latest_obs_for_action_lock,
+                        "latest_obs_for_action": latest_obs_for_action,
+                        "omy_display_action_lock": omy_display_action_lock,
+                        "omy_display_action": omy_display_action,
+                        "gripper_got_lock": gripper_got_lock,
+                        "latest_got0_holder": latest_got0_holder,
+                        "ros_gripper_joint_name": _grip_name,
+                    },
+                )
+                omy_action_update_process.start()
+                _log.info(
+                    "Waiting for OMY spawn EE stable + omy_stream_ready "
+                    "(CRP stays without GP/GI until then; pendant may use moveabsj)..."
+                )
+                while not omy_stream_ready.wait(timeout=2.0):
+                    if not omy_action_update_process.is_alive():
+                        raise RuntimeError("OMY EE spawn process exited before omy_stream_ready")
+                    _log.info("Still waiting for omy_stream_ready (spawn stabilizing EE)...")
+
+                # Arm CRP only after OMY spawn ref is ready.
+                # Keep the 4/4-latched p0/hold_rpy — do NOT re-read endpose here.
+                # A second get_current_endpose() during spawn wait has returned a
+                # distant/wrong pose (e.g. 658→467 + rpy flip) and preload+GI→GP
+                # then jerked the arm to that target.
+                init_pose = [
+                    float(p0_crp[0]),
+                    float(p0_crp[1]),
+                    float(p0_crp[2]),
+                    float(hold_rpy[0]),
+                    float(hold_rpy[1]),
+                    float(hold_rpy[2]),
+                ]
+                for _i in range(3):
+                    shared_p0[_i] = init_pose[_i]
+                    shared_hold_rpy[_i] = init_pose[_i + 3]
+                with gp_cmd_lock:
+                    for _i in range(6):
+                        latest_gp6[_i] = init_pose[_i]
+                init_matrix = trajectory_processor.init_matrix(init_pose, group_size=GP_GROUP_SIZE)
+                log_gp_points_matrix("send_GPs arm preload (no GI switch) before", init_matrix)
+                # Preload registers while pendant can still be in joint / moveabsj.
+                robot.send_GPs(10, init_matrix, switch_to_gp_mode=False)
+                robot.send_GPs(20, init_matrix, switch_to_gp_mode=False)
+                # Arm GOT once before fork owns SDK. Seed fork dedup to this value so the
+                # first GP tick does not immediately re-send the same GOT.
+                _arm_got0: int | None = None
+                if _grip_name and latest_got0_holder is not None:
+                    if held_got0 is not None and held_got0[0] is not None:
+                        latest_got0_holder[0] = int(held_got0[0])
+                    _arm_got0 = int(latest_got0_holder[0])
+                    robot.set_GOT(0, _arm_got0)
+                robot.ensure_gp_mode()
+                robot.set_motion_enabled(True)
+                _log.info(
+                    "CRP GP mode+GI56 ON: preload xyz=(%.4f %.4f %.4f) hold_rpy=(%.4f %.4f %.4f) "
+                    "got0=%s — start fork before releasing OMY deltas",
+                    *init_pose[:3],
+                    *init_pose[3:],
+                    _arm_got0,
+                )
+
+                # Parent obs from cache only while fork owns SDK — seed from init_pose,
+                # do NOT refresh_proprio / get_observation here (delays fork + steals SDK).
+                robot.enable_proprio_cache()
+                robot.update_ee_cache_from_pose6(init_pose)
+                prev_action_for_obs = {}
+                _seed_j = [0.0] * 6
+                latest_joints6 = mp_ctx.Array("d", _seed_j, lock=False)
+                if robot.config.enable_ee:
+                    for _i, _name in enumerate(_EE_ACTION_NAMES):
+                        prev_action_for_obs[_name] = float(init_pose[_i])
+                if robot.config.use_gripper_feature:
+                    if _arm_got0 is not None:
+                        prev_action_for_obs["gripper.pos"] = float(_arm_got0)
+                    else:
+                        prev_action_for_obs["gripper.pos"] = 0.0
+
+                gp_sender_stop = mp_ctx.Event()
+                _sample_joints = bool(robot.config.enable_joint)
+                # GP first every tick; joint read ~dataset fps (not every 100Hz, not EE).
+                _joint_every = max(1, int(round(DEFAULT_GP_STREAM_HZ / max(1.0, float(fps)))))
+                _fork_got_seed = int(_arm_got0) if _arm_got0 is not None else -10**9
+
+                def _fixed_rate_gp_sender() -> None:
+                    """Fork: GP @stream Hz; set_GOT only when value changes; optional joint samples."""
+                    assert latest_gp6 is not None
+                    assert gp_cmd_lock is not None
+                    assert gp_sender_stop is not None
+                    sdk = robot.crp_arm_robot
+                    period = 1.0 / DEFAULT_GP_STREAM_HZ
+                    t_next = time.perf_counter()
+                    tick = 0
+                    last_got0_sent = _fork_got_seed
+                    while not gp_sender_stop.is_set():
+                        with gp_cmd_lock:
+                            row = [float(latest_gp6[i]) for i in range(6)]
+                        mat = [row[:] for _ in range(GP_GROUP_SIZE)]
+                        sdk.set_GPs(10, mat)
+                        if gripper_got_lock is not None and latest_got0_holder is not None:
+                            with gripper_got_lock:
+                                got_sent = int(latest_got0_holder[0])
+                            if got_sent != last_got0_sent:
+                                sdk.set_GOT(0, got_sent)
+                                last_got0_sent = got_sent
+                        tick += 1
+                        if (
+                            _sample_joints
+                            and latest_joints6 is not None
+                            and tick % _joint_every == 0
+                        ):
+                            try:
+                                jraw = sdk.read_joints() or {}
+                                for _i in range(1, 7):
+                                    latest_joints6[_i - 1] = _resolve_crp_read_joints_value(
+                                        jraw, f"j{_i}"
+                                    )
+                            except Exception:
+                                pass
+                        t_next += period
+                        dt = t_next - time.perf_counter()
+                        if dt > 0:
+                            precise_sleep(dt)
+                        else:
+                            t_next = time.perf_counter()
+
+                # Fork must stream init_pose BEFORE spawn writes deltas — otherwise the first
+                # send jumps from preload to accumulated OMY motion (stall then steep catch-up).
+                gp_sender_process = mp_ctx.Process(target=_fixed_rate_gp_sender, name="crp_gp_sender", daemon=True)
+                gp_sender_process.start()
+                _log.info(
+                    "Fork started: GP@%.0fHz; joint_sample=%s every %d ticks (~%.0fHz); "
+                    "obs.ee=prev action (enable_ee=%s).",
+                    DEFAULT_GP_STREAM_HZ,
+                    _sample_joints,
+                    _joint_every,
+                    DEFAULT_GP_STREAM_HZ / _joint_every,
+                    robot.config.enable_ee,
+                )
+                print("[EE GP] fork streaming init pose; releasing OMY→GP deltas")
+                omy_gp_armed.set()
+                _print_teleop_ready_banner(phase=phase, reset_teleop=reset_teleop)
+            else:
+                init_matrix = trajectory_processor.init_matrix(robot.get_current_endpose(), group_size=GP_GROUP_SIZE)
+                log_gp_points_matrix("send_GPs init non-OMY reg10/20 before", init_matrix)
+                robot.send_GPs(10, init_matrix)
+                robot.send_GPs(20, init_matrix)
+
         while timestamp < control_time_s:
             start_loop_t = time.perf_counter()
 
             if events["exit_early"]:
                 events["exit_early"] = False
                 break
+
+            # Manual reset: poll cameras / keyboard only — never command the arm.
+            if phase == "reset" and not reset_teleop:
+                if isinstance(robot, CRPArm):
+                    _ = robot.get_observation()
+                dt_s = time.perf_counter() - start_loop_t
+                precise_sleep(max(1 / fps - dt_s, 0.0))
+                timestamp = time.perf_counter() - start_episode_t
+                continue
+
+            # Obs: measured joints (shared) + delayed EE/gripper; no parent SDK while fork lives.
+            if isinstance(robot, CRPArm) and (
+                prev_action_for_obs is not None or latest_joints6 is not None
+            ):
+                _meas = (
+                    _joints_dict_from_shared6(latest_joints6)
+                    if robot.config.enable_joint and latest_joints6 is not None
+                    else None
+                )
+                _publish_stream_obs_cache(
+                    robot, prev=prev_action_for_obs, measured_joints=_meas
+                )
 
             obs = robot.get_observation()
             if latest_obs_for_action_lock is not None and latest_obs_for_action is not None:
@@ -745,11 +1040,11 @@ def record_loop(
                 robot_action_to_send = robot_action_processor((act_processed_policy, obs))
                 if trajectory_processor is not None:
                     if isinstance(robot, CRPArm):
-                        _crp_send_gp_endpose6(robot, trajectory_processor, list(robot_action_to_send))
+                        send_gp_endpose6(robot, trajectory_processor, list(robot_action_to_send))
                     else:
                         trajectory_processor.write_point(robot_action_to_send)
                         _pts = trajectory_processor.read_points()
-                        _log_gp_points_matrix("send_GPs(10) policy before", _pts)
+                        log_gp_points_matrix("send_GPs(10) policy before", _pts)
                         _ = robot.send_GPs(10, _pts)
                 else:
                     _ = robot.send_endpose(robot_action_to_send)
@@ -763,64 +1058,53 @@ def record_loop(
                     if trajectory_processor is None:
                         raise RuntimeError("trajectory_processor is required for OMY EE incremental streaming (send_GPs).")
                     if gp_sender_process is None:
-                        if p0_crp is None or omy_ref_xyz is None:
-                            raise RuntimeError("OMY EE incremental state was not initialized (p0_crp / omy_ref_xyz).")
-                        omy_now = None
-                        _ee_fb = teleop.get_ros_end_effector_xyz_rpy_deg()
-                        if _ee_fb is not None:
-                            omy_now = [float(_ee_fb[0][i]) for i in range(3)]
-                        if omy_now is not None:
-                            d = [
-                                CRP_EE_OMY_DELTA_SCALE * (float(omy_now[i]) - float(omy_ref_xyz[i]))
-                                for i in range(3)
-                            ]
-                            px = p0_crp[0] + d[0]
-                            py = p0_crp[1] + d[1]
-                            pz = p0_crp[2] + d[2]
-                            endpose_cmd = [
-                                px,
-                                py,
-                                pz,
-                                CRP_EE_FIXED_ROLL_DEG,
-                                CRP_EE_FIXED_PITCH_DEG,
-                                CRP_EE_FIXED_YAW_DEG,
-                            ]
-                            _crp_send_gp_endpose6(robot, trajectory_processor, endpose_cmd)
-                        if getattr(teleop.config, "ros_gripper_joint_name", ""):
-                            _got_fb = _omy_rh_r1_to_got0(float(robot_action_to_send_tamp.get("gripper.pos", 0.0)))
-                            if _got_fb != last_got0_sent[0]:
-                                robot.set_GOT(0, _got_fb)
-                                last_got0_sent[0] = _got_fb
+                        # Not armed yet (before EE wait 4/4 + arm) or stream already torn down.
+                        # Never send_GPs/set_GOT from the main loop in this gap.
+                        pass
+                    # When armed, fork sender owns all send_GPs / set_GOT.
                 else:
-                    robot_action_to_send = _ee_action_to_crp_endpose_list(robot_action_to_send_tamp)
+                    robot_action_to_send = ee_action_to_crp_endpose_list(robot_action_to_send_tamp)
                     if trajectory_processor is not None:
                         if isinstance(robot, CRPArm):
-                            _crp_send_gp_endpose6(robot, trajectory_processor, robot_action_to_send)
+                            send_gp_endpose6(robot, trajectory_processor, robot_action_to_send)
                         else:
                             trajectory_processor.write_point(robot_action_to_send)
                             _pts = trajectory_processor.read_points()
-                            _log_gp_points_matrix("send_GPs(10) teleop before", _pts)
+                            log_gp_points_matrix("send_GPs(10) teleop before", _pts)
                             _ = robot.send_GPs(10, _pts)
                     else:
                         _ = robot.send_endpose(robot_action_to_send)
 
             if dataset is not None:
-                # Same joint snapshot as in this ``get_observation()`` call (avoids a second
-                # ``read_joints()`` round-trip per frame on CRP).
+                # action.ee/GOT = command at t; action.joint = measured at t+1 (buffered write).
+                # prev_action_for_obs only tracks EE/gripper (delayed obs), not joints.
+                gp6_cmd: list[float] | None = None
+                joints_now: dict[str, float] | None = None
+                use_next_joint_action = False
                 if isinstance(robot, CRPArm):
-                    joint_snapshot = {
-                        k.removesuffix(".pos"): float(v)
-                        for k, v in obs.items()
-                        if k.endswith(".pos") and isinstance(v, (int, float))
-                    }
-                    crp_arm_joint_values = _action_values_for_dataset_from_crp_joints(
-                        dataset, joint_snapshot
+                    use_next_joint_action = bool(
+                        robot.config.enable_joint and latest_joints6 is not None
+                    )
+                    if use_next_joint_action:
+                        joints_now = _joints_dict_from_shared6(latest_joints6)
+                    if robot.config.enable_ee and latest_gp6 is not None:
+                        if gp_cmd_lock is not None:
+                            with gp_cmd_lock:
+                                gp6_cmd = [float(latest_gp6[i]) for i in range(6)]
+                        else:
+                            gp6_cmd = [float(latest_gp6[i]) for i in range(6)]
+                    joint_snapshot = None if use_next_joint_action else (
+                        {f"j{i}": float(joints_now[f"j{i}.pos"]) for i in range(1, 7)}
+                        if joints_now is not None
+                        else None
                     )
                 else:
-                    crp_arm_joint = robot.crp_arm_robot.read_joints()
-                    crp_arm_joint_values = _action_values_for_dataset_from_crp_joints(
-                        dataset, crp_arm_joint
-                    )
+                    joint_snapshot = {
+                        k: float(v)
+                        for k, v in (robot.crp_arm_robot.read_joints() or {}).items()
+                    }
+
+                gripper_got0: float | None = None
                 action_names_ds = list((dataset.features.get("action") or {}).get("names") or [])
                 if (
                     "gripper.pos" in action_names_ds
@@ -830,16 +1114,45 @@ def record_loop(
                 ):
                     if gripper_got_lock is not None and latest_got0_holder is not None:
                         with gripper_got_lock:
-                            _g_ds = float(latest_got0_holder[0])
+                            gripper_got0 = float(latest_got0_holder[0])
                     else:
-                        _g_ds = float(
-                            _omy_rh_r1_to_got0(float(robot_action_to_send_tamp.get("gripper.pos", 0.0)))
+                        gripper_got0 = float(
+                            omy_rh_r1_to_got0(float(robot_action_to_send_tamp.get("gripper.pos", 0.0)))
                         )
-                    crp_arm_joint_values = {**crp_arm_joint_values, "gripper.pos": _g_ds}
 
-                action_frame = build_dataset_frame(dataset.features, crp_arm_joint_values, prefix="action")
-                frame = {**observation_frame, **action_frame, "task": single_task}
-                dataset.add_frame(frame)
+                crp_arm_joint_values = _build_dataset_action_values(
+                    dataset,
+                    joint_snapshot=joint_snapshot,
+                    gp6=gp6_cmd,
+                    gripper_got0=gripper_got0,
+                )
+
+                if use_next_joint_action:
+                    if pending_dataset_frame is not None and joints_now is not None:
+                        _flush_pending_dataset_frame(
+                            dataset,
+                            pending_dataset_frame,
+                            joint_action=joints_now,
+                        )
+                    pending_dataset_frame = {
+                        "observation_frame": observation_frame,
+                        "action_values": crp_arm_joint_values,
+                        "task": single_task,
+                    }
+                else:
+                    action_frame = build_dataset_frame(
+                        dataset.features, crp_arm_joint_values, prefix="action"
+                    )
+                    dataset.add_frame(
+                        {**observation_frame, **action_frame, "task": single_task}
+                    )
+
+                if prev_action_for_obs is not None:
+                    for _name in _EE_ACTION_NAMES:
+                        if _name in crp_arm_joint_values:
+                            prev_action_for_obs[_name] = float(crp_arm_joint_values[_name])
+                    if "gripper.pos" in crp_arm_joint_values:
+                        prev_action_for_obs["gripper.pos"] = float(crp_arm_joint_values["gripper.pos"])
 
             if display_data:
                 log_rerun_data(observation=obs_processed, action=action_values)
@@ -850,14 +1163,45 @@ def record_loop(
             timestamp = time.perf_counter() - start_episode_t
 
     finally:
+        # Drop trailing pending row: it has obs but no next joint for action.
+        # Its joints already became action.joint of the previous written transition.
+        pending_dataset_frame = None
+        # Stop EE/GP workers FIRST — never write GI/SDK while the fork still owns the client
+        # (concurrent set_GI + send_GPs caused left-key ``read user pose failed`` / abort).
+        if (
+            held_got0 is not None
+            and gripper_got_lock is not None
+            and latest_got0_holder is not None
+        ):
+            try:
+                with gripper_got_lock:
+                    held_got0[0] = int(latest_got0_holder[0])
+            except Exception:
+                logging.getLogger(__name__).debug("teardown: could not latch held_got0", exc_info=True)
         if gp_sender_stop is not None:
             gp_sender_stop.set()
         if omy_action_stop is not None:
             omy_action_stop.set()
-        if gp_sender_process is not None:
+        if gp_sender_process is not None and gp_sender_process.pid is not None:
             gp_sender_process.join(timeout=5.0)
-        if omy_action_update_process is not None:
+        if omy_action_update_process is not None and omy_action_update_process.pid is not None:
             omy_action_update_process.join(timeout=8.0)
+        if isinstance(robot, CRPArm):
+            robot.disable_proprio_cache()
+            robot.clear_ee_cache()  # never latch next arm from episode-start EE cache
+            try:
+                robot.set_motion_enabled(False)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "teardown: failed to clear motion enable GI", exc_info=True
+                )
+            # Brief settle so the next record_loop's get_current_endpose is accepted.
+            robot.wait_controller_ready(timeout_s=1.0)
+        logging.getLogger(__name__).info(
+            "EE/GP stream stopped; GI56 OFF; hold last GP; held_got0=%s",
+            None if held_got0 is None else held_got0[0],
+        )
+        print("[EE GP] stream stopped; GI56 move OFF; hold last GP")
         if mp_manager is not None:
             mp_manager.shutdown()
 
@@ -906,17 +1250,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
 
     if cfg.resume:
-        dataset = LeRobotDataset(
+        num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
+        dataset = LeRobotDataset.resume(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            image_writer_processes=cfg.dataset.num_image_writer_processes if num_cameras > 0 else 0,
+            image_writer_threads=(
+                cfg.dataset.num_image_writer_threads_per_camera * num_cameras if num_cameras > 0 else 0
+            ),
         )
-
-        if hasattr(robot, "cameras") and len(robot.cameras) > 0:
-            dataset.start_image_writer(
-                num_processes=cfg.dataset.num_image_writer_processes,
-                num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-            )
         sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
     else:
         sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
@@ -953,13 +1296,27 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     listener, events = init_keyboard_listener()
 
     print("当前速度比：", robot.get_speed_ratio())
-    robot.set_speed_ratio(20)
+    robot.set_speed_ratio(int(cfg.speed_ratio))
     print("当前速度比：", robot.get_speed_ratio())
+    # Always print so axis signs are visible even if logging is filtered.
+    print(
+        f"[EE GP] applied ee_step_sizes={cfg.ee_step_sizes} "
+        f"ee_delta_scale={cfg.ee_delta_scale} "
+        f"(code defaults step={DEFAULT_EE_STEP_SIZES} scale={EE_OMY_DELTA_SCALE})"
+    )
+    logging.getLogger(__name__).info(
+        "RecordConfig EE overrides applied: ee_step_sizes=%s ee_delta_scale=%.4f speed_ratio=%s",
+        cfg.ee_step_sizes,
+        cfg.ee_delta_scale,
+        cfg.speed_ratio,
+    )
 
     trajectory_processor = TrajectoryProcessor()
 
     with VideoEncodingManager(dataset):
         recorded_episodes = 0
+        # Persist last commanded GOT across record↔reset so re-arm does not snap gripper.
+        held_got0: list[int | None] = [None]
         while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
             log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
             record_loop(
@@ -978,8 +1335,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
                 trajectory_processor=trajectory_processor,
+                ee_step_sizes=cfg.ee_step_sizes,
+                ee_delta_scale=cfg.ee_delta_scale,
+                phase="record",
+                held_got0=held_got0,
             )
 
+            # Between episodes: reset wait (cyan). reset_teleop toggles OMY re-arm vs hold-still.
             if not events["stop_recording"] and (
                 (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
             ):
@@ -991,11 +1353,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     teleop_action_processor=teleop_action_processor,
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
+                    teleop=teleop if cfg.reset_teleop else None,
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
-                    trajectory_processor=trajectory_processor,
+                    trajectory_processor=trajectory_processor if cfg.reset_teleop else None,
+                    ee_step_sizes=cfg.ee_step_sizes,
+                    ee_delta_scale=cfg.ee_delta_scale,
+                    phase="reset",
+                    held_got0=held_got0,
+                    reset_teleop=cfg.reset_teleop,
                 )
 
             if events["rerecord_episode"]:

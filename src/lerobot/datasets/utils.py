@@ -14,12 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import copy
 import dataclasses
 import importlib.resources
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import datasets
 import numpy as np
@@ -270,6 +273,114 @@ def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
         else:
             raise NotImplementedError(f"The value '{value}' of type '{type(value)}' is not supported.")
     return unflatten_dict(serialized_dict)
+
+
+def _flatten_to_float_list(value: Any) -> list[float]:
+    """Flatten nested lists / scalars into a 1-D ``list[float]`` for policy configs."""
+    if isinstance(value, (int | float | np.generic)):
+        return [float(value)]
+    if isinstance(value, (torch.Tensor | np.ndarray)):
+        return [float(x) for x in np.asarray(value).reshape(-1).tolist()]
+    if isinstance(value, list):
+        out: list[float] = []
+        for item in value:
+            out.extend(_flatten_to_float_list(item))
+        return out
+    raise TypeError(f"Cannot flatten stats value of type {type(value)}: {value!r}")
+
+
+def dataset_stats_to_policy_config(
+    stats: dict[str, dict[str, Any]],
+    feature_keys: Sequence[str] | None = None,
+) -> dict[str, dict[str, list[float]]]:
+    """Convert dataset meta stats into draccus-friendly policy ``dataset_stats``.
+
+    Image stats are often shaped ``(C, 1, 1)``; ``tolist()`` then yields nested lists such as
+    ``[[[0.0]], ...]``, which ``dict[str, dict[str, list[float]]]`` cannot decode.
+    """
+    serialized = serialize_dict(stats)
+    if feature_keys is not None:
+        key_set = set(feature_keys)
+        serialized = {k: v for k, v in serialized.items() if k in key_set}
+
+    out: dict[str, dict[str, list[float]]] = {}
+    for feat_key, feat_stats in serialized.items():
+        if not isinstance(feat_stats, dict):
+            continue
+        out[feat_key] = {
+            stat_name: _flatten_to_float_list(stat_val) for stat_name, stat_val in feat_stats.items()
+        }
+    return out
+
+
+def ensure_vector_stats_match_features(
+    stats: dict[str, dict[str, list[float]]] | None,
+    features: dict[str, Any],
+) -> dict[str, dict[str, list[float]]] | None:
+    """Resize flat vector min/max/mean/std to match declared feature dims.
+
+    GaussianActor defaults ship 2-D state / 3-D action stats. When ``dataset`` is
+    unset those defaults collide with CRP-style 6/7-D features at normalize time.
+    """
+    if not stats or not features:
+        return stats
+
+    out = copy.deepcopy(stats)
+    default_fills = {"min": 0.0, "max": 1.0, "mean": 0.0, "std": 1.0}
+
+    for key, feat in features.items():
+        feat_type = getattr(feat, "type", None)
+        type_name = getattr(feat_type, "value", None) or str(feat_type)
+        if type_name == "VISUAL":
+            continue
+        shape = tuple(getattr(feat, "shape", ()) or ())
+        if len(shape) != 1:
+            continue
+        dim = int(shape[0])
+        if key not in out:
+            if type_name == "ACTION" and dim >= 7:
+                # CRP joint IL: j1..j6 deg-ish + GOT0 in [0, 1000]. Placeholder 0..1
+                # denorms gripper to ~0 → jaw slams closed under tanh policies.
+                out[key] = {
+                    "min": [-180.0] * (dim - 1) + [0.0],
+                    "max": [180.0] * (dim - 1) + [1000.0],
+                }
+            elif type_name == "STATE" and dim >= 6:
+                out[key] = {"min": [-180.0] * dim, "max": [180.0] * dim}
+            else:
+                out[key] = {"min": [0.0] * dim, "max": [1.0] * dim}
+            logging.warning(
+                "dataset_stats missing %s; using placeholder bounds dim=%s type=%s",
+                key,
+                dim,
+                type_name,
+            )
+            continue
+        for name, fill in default_fills.items():
+            if name not in out[key]:
+                continue
+            vals = out[key][name]
+            if not isinstance(vals, list) or len(vals) == dim:
+                continue
+            if type_name == "ACTION" and dim >= 7 and name in ("min", "max"):
+                replacement = (
+                    ([-180.0] * (dim - 1) + [0.0])
+                    if name == "min"
+                    else ([180.0] * (dim - 1) + [1000.0])
+                )
+            elif type_name == "STATE" and dim >= 6 and name in ("min", "max"):
+                replacement = [-180.0] * dim if name == "min" else [180.0] * dim
+            else:
+                replacement = [fill] * dim
+            logging.warning(
+                "dataset_stats[%s][%s] len=%s != feature dim=%s; replacing",
+                key,
+                name,
+                len(vals),
+                dim,
+            )
+            out[key][name] = replacement
+    return out
 
 
 def is_valid_version(version: str) -> bool:

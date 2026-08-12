@@ -33,11 +33,14 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
     end-effector (x, y, z) and optionally the gripper.
 
     Attributes:
-        use_gripper: If True, assumes the 4th element of the tensor is the
-                     gripper action.
+        use_gripper: If True, assumes the last element of the tensor is the
+                     gripper action (index 3 for xyz-only, index 6 when rpy present).
+        include_rpy: If True (default), map indices 3..5 to delta_roll/pitch/yaw when
+                     the tensor has at least 6 elements. Legacy 3/4-D tensors stay xyz-only.
     """
 
     use_gripper: bool = True
+    include_rpy: bool = True
 
     def action(self, action: PolicyAction) -> RobotAction:
         if not isinstance(action, PolicyAction):
@@ -46,13 +49,18 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
         if action.dim() > 1:
             action = action.squeeze(0)
 
-        # TODO (maractingi): add rotation
         delta_action = {
             "delta_x": action[0].item(),
             "delta_y": action[1].item(),
             "delta_z": action[2].item(),
         }
-        if self.use_gripper:
+        if self.include_rpy and action.numel() >= 6:
+            delta_action["delta_roll"] = action[3].item()
+            delta_action["delta_pitch"] = action[4].item()
+            delta_action["delta_yaw"] = action[5].item()
+            if self.use_gripper and action.numel() > 6:
+                delta_action["gripper"] = action[6].item()
+        elif self.use_gripper and action.numel() > 3:
             delta_action["gripper"] = action[3].item()
         return delta_action
 
@@ -63,6 +71,11 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
             features[PipelineFeatureType.ACTION][f"delta_{axis}"] = PolicyFeature(
                 type=FeatureType.ACTION, shape=(1,)
             )
+        if self.include_rpy:
+            for axis in ["roll", "pitch", "yaw"]:
+                features[PipelineFeatureType.ACTION][f"delta_{axis}"] = PolicyFeature(
+                    type=FeatureType.ACTION, shape=(1,)
+                )
 
         if self.use_gripper:
             features[PipelineFeatureType.ACTION]["gripper"] = PolicyFeature(

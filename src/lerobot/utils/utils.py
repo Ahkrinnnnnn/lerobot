@@ -65,7 +65,13 @@ def init_logging(
         dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fnameline = f"{record.pathname}:{record.lineno}"
         pid_str = f"[PID: {os.getpid()}] " if display_pid else ""
-        return f"{record.levelname} {pid_str}{dt} {fnameline[-15:]:>15} {record.getMessage()}"
+        message = f"{record.levelname} {pid_str}{dt} {fnameline[-15:]:>15} {record.getMessage()}"
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            if record.exc_text:
+                message = f"{message}\n{record.exc_text}"
+        return message
 
     formatter = logging.Formatter()
     formatter.format = custom_format

@@ -59,8 +59,8 @@ keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artifici
 
 dependencies = [
     # Core ML
-    "torch>=2.7,<2.12.0",
-    "torchvision>=0.22.0,<0.27.0",
+    "torch>=2.7,<=2.12.0",
+    "torchvision>=0.22.0,<=0.27.0",
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "opencv-python-headless>=4.9.0,<4.14.0",
     "Pillow>=10.0.0,<13.0.0",
@@ -299,6 +299,7 @@ lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"
 lerobot-record="lerobot.scripts.lerobot_record:main"
 lerobot-record-crp-omy="lerobot.scripts.crp_record_omy_ee_inc:main"
+lerobot-replay-crp-ee="lerobot.scripts.crp_replay_ee_abs:main"
 lerobot-record-humanoid="lerobot.scripts.lerobot_record_humanoid:main"
 lerobot-replay="lerobot.scripts.lerobot_replay:main"
 lerobot-setup-motors="lerobot.scripts.lerobot_setup_motors:main"

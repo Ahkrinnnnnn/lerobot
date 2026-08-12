@@ -810,7 +810,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if obj._requested_root is not None:
             obj._requested_root.mkdir(exist_ok=True, parents=True)
 
-        # Load metadata (revision-safe when root is not provided)
+        # Load local metadata only (explicit root must already exist with meta/).
         obj.meta = LeRobotDatasetMetadata(
             obj.repo_id, obj._requested_root, obj.revision, force_cache_sync=force_cache_sync
         )

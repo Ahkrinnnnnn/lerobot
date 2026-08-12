@@ -94,7 +94,7 @@ class LeRobotDatasetMetadata:
         """
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
-        self._requested_root = Path(root) if root is not None else None
+        self._requested_root = Path(root).expanduser().resolve() if root is not None else None
         self.root = self._requested_root if self._requested_root is not None else HF_LEROBOT_HOME / repo_id
         self._pq_writer = None
         self.latest_episode = None
@@ -108,7 +108,14 @@ class LeRobotDatasetMetadata:
             ):
                 raise FileNotFoundError
             self._load_metadata()
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            # Explicit local root: never block on Hub (offline / private repo_id hang).
+            if self._requested_root is not None and not force_cache_sync:
+                raise FileNotFoundError(
+                    f"Local dataset metadata missing under {self.root}. "
+                    "Use resume=false to create a new dataset, or point dataset.root at an "
+                    "existing folder that contains meta/info.json."
+                ) from exc
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 

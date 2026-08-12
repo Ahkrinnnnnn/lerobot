@@ -42,7 +42,27 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     online_ratio: float = 0.5
 
     def validate(self) -> None:
-        super().validate()
+        # Actor and learner intentionally share ``output_dir``. The parent
+        # ``TrainPipelineConfig.validate`` raises ``FileExistsError`` when that
+        # directory already exists and ``resume=False``, which breaks starting
+        # the actor after the learner (learner creates the dir for logs first).
+        # Checkpoint overwrite protection remains in ``learner.handle_resume_logic``.
+        from pathlib import Path
+
+        saved_output_dir = self.output_dir
+        bypass_exists_check = (
+            not self.resume
+            and isinstance(saved_output_dir, Path)
+            and saved_output_dir.is_dir()
+        )
+        if bypass_exists_check:
+            self.output_dir = saved_output_dir / ".__rl_shared_output_dir__"
+
+        try:
+            super().validate()
+        finally:
+            if bypass_exists_check:
+                self.output_dir = saved_output_dir
 
         if self.algorithm is None:
             self.algorithm = make_algorithm_config("sac")

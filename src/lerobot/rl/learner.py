@@ -46,11 +46,13 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 
 import logging
 import os
+import random
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from pprint import pformat
+from queue import Empty
 from typing import TYPE_CHECKING, Any
 
 from lerobot.utils.import_utils import _grpc_available, require_package
@@ -83,7 +85,9 @@ from lerobot.configs import parser
 from lerobot.datasets import LeRobotDataset, make_dataset
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.robots import so_follower  # noqa: F401
+from lerobot.robots.crp_arm.config_crp_arm import CRPArmConfig  # noqa: F401 — register crp_arm
 from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+from lerobot.teleoperators.OMY_L100.config_OMY_L100 import OMYL100Config  # noqa: F401 — register OMY_L100
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport.utils import (
     MAX_MESSAGE_SIZE,
@@ -248,15 +252,19 @@ def start_learner_threads(
         logging.info("[LEARNER] Training process stopped")
     except Exception:
         logging.exception("[LEARNER] Unhandled exception in training loop")
-        shutdown_event.set()
     finally:
+        # Stop gRPC first, then close queues — closing queues while StreamParameters
+        # still drains them used to raise "handle is closed" and leak worker threads.
+        shutdown_event.set()
+        logging.info("[LEARNER] Waiting for communication process to stop")
+        communication_process.join(timeout=SHUTDOWN_TIMEOUT + 5)
+        if communication_process.is_alive():
+            logging.warning("[LEARNER] Communication process did not stop in time")
+
         logging.info("[LEARNER] Closing queues")
         transition_queue.close()
         interaction_message_queue.close()
         parameters_queue.close()
-
-        communication_process.join()
-        logging.info("[LEARNER] Communication process joined")
 
         transition_queue.cancel_join_thread()
         interaction_message_queue.cancel_join_thread()
@@ -322,6 +330,61 @@ def add_actor_information_and_train(
 
     logging.info("Initializing policy")
 
+    # Prefer real dataset stats over GaussianActor defaults (state min/max length 2).
+    if cfg.dataset is not None:
+        from lerobot.datasets import LeRobotDatasetMetadata
+
+        try:
+            ds_meta = LeRobotDatasetMetadata(
+                cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            )
+            if ds_meta.stats:
+                from lerobot.datasets.utils import dataset_stats_to_policy_config
+
+                # Flat list[float] only — nested image stats (C,1,1) break draccus encode/decode.
+                feature_keys = list(cfg.policy.input_features) + list(cfg.policy.output_features)
+                cfg.policy.dataset_stats = dataset_stats_to_policy_config(
+                    ds_meta.stats, feature_keys=feature_keys
+                )
+                logging.info("Loaded dataset_stats from %s", cfg.dataset.repo_id)
+
+            # Abs EE demos: replace action stats with load-time δ (+ optional rpy).
+            offline_override = None
+            include_rpy = True
+            if cfg.env is not None and getattr(cfg.env, "processor", None) is not None:
+                crp_ee = getattr(cfg.env.processor, "crp_ee", None)
+                if crp_ee is not None:
+                    offline_override = getattr(crp_ee, "offline_ee_action", None)
+                    include_rpy = bool(getattr(crp_ee, "include_rpy", True))
+            if offline_override != "delta":
+                from lerobot.datasets import LeRobotDataset
+                from lerobot.rl.ee_abs_to_delta import maybe_override_policy_action_stats_from_abs_ee_dataset
+
+                # Lightweight column read (no video decode) for delta action bounds.
+                _stats_ds = LeRobotDataset(
+                    cfg.dataset.repo_id,
+                    root=cfg.dataset.root,
+                    episodes=cfg.dataset.episodes,
+                    download_videos=False,
+                )
+                cfg.policy.dataset_stats = maybe_override_policy_action_stats_from_abs_ee_dataset(
+                    cfg.policy.dataset_stats,
+                    features=ds_meta.features,
+                    hf_dataset=_stats_ds.hf_dataset,
+                    override=offline_override,
+                    include_rpy=include_rpy,
+                )
+                del _stats_ds
+        except Exception:
+            logging.exception("Failed to load dataset_stats; keeping policy defaults")
+
+    from lerobot.datasets.utils import ensure_vector_stats_match_features
+
+    cfg.policy.dataset_stats = ensure_vector_stats_match_features(
+        cfg.policy.dataset_stats,
+        {**cfg.policy.input_features, **cfg.policy.output_features},
+    )
+
     policy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
@@ -385,6 +448,34 @@ def add_actor_information_and_train(
     if cfg.dataset is not None:
         dataset_repo_id = cfg.dataset.repo_id
 
+    # After demo/offline buffer init, save a training-style checkpoint for debugging
+    # (policy + optimizers + offline buffer) before any online updates.
+    if (
+        saving_checkpoint
+        and not cfg.resume
+        and offline_replay_buffer is not None
+        and len(offline_replay_buffer) > 0
+    ):
+        logging.info(
+            "[LEARNER] Saving initial checkpoint after demo buffer init "
+            f"(offline_size={len(offline_replay_buffer)}, step={optimization_step})"
+        )
+        save_training_checkpoint(
+            cfg=cfg,
+            optimization_step=optimization_step,
+            online_steps=online_steps,
+            interaction_message=None,
+            policy=policy,
+            optimizers=optimizers,
+            replay_buffer=replay_buffer,
+            algorithm=algorithm,
+            offline_replay_buffer=offline_replay_buffer,
+            dataset_repo_id=dataset_repo_id,
+            fps=fps,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+        )
+
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
         # Exit the training loop if shutdown is requested
@@ -437,11 +528,24 @@ def add_actor_information_and_train(
             if wandb_logger:
                 wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
 
-        # Calculate and log optimization frequency
+        # Calculate and log optimization frequency + progress (every step so the terminal
+        # shows learner progress; previously only Hz was logged and the step counter
+        # appeared only every ``log_freq``, which is easy to miss in the scrollback).
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
 
-        logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
+        logging.info(
+            "[LEARNER] opt_step=%s/%s | loop_Hz=%.3f | online_buf=%s%s",
+            optimization_step,
+            online_steps,
+            frequency_for_one_optimization_step,
+            len(replay_buffer),
+            (
+                f" | offline_buf={len(offline_replay_buffer)}"
+                if offline_replay_buffer is not None
+                else ""
+            ),
+        )
 
         # Log optimization frequency
         if wandb_logger:
@@ -525,6 +629,11 @@ def start_learner(
         options=[
             ("grpc.max_receive_message_length", MAX_MESSAGE_SIZE),
             ("grpc.max_send_message_length", MAX_MESSAGE_SIZE),
+            # Detect crashed actors so StreamParameters releases worker threads.
+            ("grpc.keepalive_time_ms", 10_000),
+            ("grpc.keepalive_timeout_ms", 5_000),
+            ("grpc.http2.min_recv_ping_interval_without_data_ms", 5_000),
+            ("grpc.keepalive_permit_without_calls", 1),
         ],
     )
 
@@ -624,16 +733,19 @@ def save_training_checkpoint(
     # TODO : temporary save replay buffer here, remove later when on the robot
     # We want to control this with the keyboard inputs
     dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
+    if len(replay_buffer) > 0:
+        if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+            shutil.rmtree(dataset_dir)
 
-    # Save dataset
-    # NOTE: Handle the case where the dataset repo id is not specified in the config
-    # eg. RL training without demonstrations data
-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+        # Save dataset
+        # NOTE: Handle the case where the dataset repo id is not specified in the config
+        # eg. RL training without demonstrations data
+        repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    else:
+        logging.info("Skip saving empty online replay buffer")
 
-    if offline_replay_buffer is not None:
+    if offline_replay_buffer is not None and len(offline_replay_buffer) > 0:
         dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
         if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
             shutil.rmtree(dataset_offline_dir)
@@ -643,11 +755,57 @@ def save_training_checkpoint(
             fps=fps,
             root=dataset_offline_dir,
         )
+    elif offline_replay_buffer is not None:
+        logging.info("Skip saving empty offline replay buffer")
 
     logging.info("Resume training")
 
 
 # Training setup functions
+
+
+def _sanitize_train_config_dataset_stats(train_config_path: str | Path) -> None:
+    """Rewrite nested image stats in a saved ``train_config.json`` to flat float lists."""
+    import json
+
+    from lerobot.datasets.utils import _flatten_to_float_list
+
+    path = Path(train_config_path)
+    if not path.is_file():
+        return
+    with open(path) as f:
+        data = json.load(f)
+
+    changed = False
+
+    def _sanitize_stats_node(stats: object) -> None:
+        nonlocal changed
+        if not isinstance(stats, dict):
+            return
+        for feat_stats in stats.values():
+            if not isinstance(feat_stats, dict):
+                continue
+            for name, value in list(feat_stats.items()):
+                flat = _flatten_to_float_list(value)
+                if flat != value:
+                    feat_stats[name] = flat
+                    changed = True
+
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            if "dataset_stats" in node:
+                _sanitize_stats_node(node["dataset_stats"])
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(data)
+    if changed:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=4)
+        logging.info("Sanitized nested dataset_stats in %s", path)
 
 
 def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipelineConfig:
@@ -700,10 +858,20 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
 
     # Load config using Draccus
     checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
+    # Sanitize nested image stats left by older runs before draccus decode.
+    _sanitize_train_config_dataset_stats(checkpoint_cfg_path)
     checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
 
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
+    # ``from_pretrained`` reloads the saved JSON which usually has no ``pretrained_path``.
+    # Point policy (and reward model) at this checkpoint so ``make_policy`` loads weights.
+    pretrained_dir = Path(checkpoint_dir) / PRETRAINED_MODEL_DIR
+    if checkpoint_cfg.policy is not None:
+        checkpoint_cfg.policy.pretrained_path = pretrained_dir
+    if checkpoint_cfg.reward_model is not None:
+        checkpoint_cfg.reward_model.pretrained_path = str(pretrained_dir)
+    checkpoint_cfg.checkpoint_path = Path(checkpoint_dir)
     return checkpoint_cfg
 
 
@@ -798,22 +966,28 @@ def initialize_replay_buffer(
     Returns:
         ReplayBuffer: Initialized replay buffer
     """
+    empty_kwargs = dict(
+        capacity=cfg.policy.online_buffer_capacity,
+        device=device,
+        state_keys=cfg.policy.input_features.keys(),
+        storage_device=storage_device,
+        optimize_memory=True,
+    )
     if not cfg.resume:
-        return ReplayBuffer(
-            capacity=cfg.policy.online_buffer_capacity,
-            device=device,
-            state_keys=cfg.policy.input_features.keys(),
-            storage_device=storage_device,
-            optimize_memory=True,
+        return ReplayBuffer(**empty_kwargs)
+
+    dataset_path = Path(cfg.output_dir) / "dataset"
+    # Online buffer is optional; an empty ``dataset/`` must not trigger a Hugging Face Hub fetch
+    # (``repo_id`` like ``local/...`` is not on the Hub and will fail with ConnectError offline).
+    if not (dataset_path / "meta" / "info.json").is_file():
+        logging.info(
+            "Resume: no local online dataset at %s — starting with empty online replay buffer",
+            dataset_path,
         )
+        return ReplayBuffer(**empty_kwargs)
 
-    logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join(cfg.output_dir, "dataset")
-
-    # NOTE: In RL is possible to not have a dataset.
-    repo_id = None
-    if cfg.dataset is not None:
-        repo_id = cfg.dataset.repo_id
+    logging.info("Resume training load the online dataset from %s", dataset_path)
+    repo_id = cfg.dataset.repo_id if cfg.dataset is not None else "local/online"
     dataset = LeRobotDataset(
         repo_id=repo_id,
         root=dataset_path,
@@ -825,6 +999,51 @@ def initialize_replay_buffer(
         state_keys=cfg.policy.input_features.keys(),
         optimize_memory=True,
     )
+
+
+def _select_episodes_for_offline_capacity(
+    repo_id: str,
+    root: str | None,
+    capacity: int,
+    seed: int | None = None,
+) -> list[int]:
+    """Pick episodes whose total frames fit in ``capacity`` (random order, seedable)."""
+    from lerobot.datasets import LeRobotDatasetMetadata
+
+    meta = LeRobotDatasetMetadata(repo_id, root=root)
+    episode_indices = list(range(meta.total_episodes))
+    rng = random.Random(seed)
+    rng.shuffle(episode_indices)
+
+    selected: list[int] = []
+    total_frames = 0
+    for ep_idx in episode_indices:
+        length = int(meta.episodes[ep_idx]["length"])
+        if selected and total_frames + length > capacity:
+            continue
+        if not selected and length > capacity:
+            # Single episode larger than capacity: still take it; buffer will subsample frames.
+            logging.warning(
+                "Episode %s has %s frames > offline_buffer_capacity=%s; will subsample frames.",
+                ep_idx,
+                length,
+                capacity,
+            )
+            return [ep_idx]
+        selected.append(ep_idx)
+        total_frames += length
+        if total_frames >= capacity:
+            break
+
+    if not selected:
+        raise ValueError("No episodes available to fill the offline replay buffer.")
+    logging.info(
+        "Auto-selected %s offline episodes (~%s frames) to fit offline_buffer_capacity=%s",
+        len(selected),
+        total_frames,
+        capacity,
+    )
+    return sorted(selected)
 
 
 def initialize_offline_replay_buffer(
@@ -845,16 +1064,50 @@ def initialize_offline_replay_buffer(
     """
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
+        # Large demos (e.g. 300k+ frames) should not be fully decoded into a small buffer.
+        # If episodes are unset, auto-pick a subset that fits ``offline_buffer_capacity``.
+        if cfg.dataset.episodes is None and cfg.policy.offline_buffer_capacity is not None:
+            from lerobot.datasets import LeRobotDatasetMetadata
+
+            meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root)
+            if meta.total_frames > cfg.policy.offline_buffer_capacity:
+                cfg.dataset.episodes = _select_episodes_for_offline_capacity(
+                    repo_id=cfg.dataset.repo_id,
+                    root=cfg.dataset.root,
+                    capacity=cfg.policy.offline_buffer_capacity,
+                    seed=cfg.seed,
+                )
         offline_dataset = make_dataset(cfg)
     else:
         logging.info("load offline dataset")
-        dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
-        offline_dataset = LeRobotDataset(
-            repo_id=cfg.dataset.repo_id,
-            root=dataset_offline_path,
-        )
+        dataset_offline_path = Path(cfg.output_dir) / "dataset_offline"
+        if not (dataset_offline_path / "meta" / "info.json").is_file():
+            logging.info(
+                "Resume: no local offline dataset at %s — rebuilding from cfg.dataset",
+                dataset_offline_path,
+            )
+            offline_dataset = make_dataset(cfg)
+        else:
+            offline_dataset = LeRobotDataset(
+                repo_id=cfg.dataset.repo_id,
+                root=dataset_offline_path,
+            )
 
     logging.info("Convert to a offline replay buffer")
+    from lerobot.configs.types import FeatureType
+
+    image_shapes = {
+        key: tuple(ft.shape)
+        for key, ft in cfg.policy.input_features.items()
+        if ft.type is FeatureType.VISUAL
+    }
+    offline_override = None
+    include_rpy = True
+    if cfg.env is not None and getattr(cfg.env, "processor", None) is not None:
+        crp_ee = getattr(cfg.env.processor, "crp_ee", None)
+        if crp_ee is not None:
+            offline_override = getattr(crp_ee, "offline_ee_action", None)
+            include_rpy = bool(getattr(crp_ee, "include_rpy", True))
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
@@ -862,6 +1115,9 @@ def initialize_offline_replay_buffer(
         storage_device=storage_device,
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
+        image_shapes=image_shapes or None,
+        offline_ee_action_override=offline_override,
+        include_rpy=include_rpy,
     )
     return offline_replay_buffer
 
@@ -925,7 +1181,10 @@ def push_actor_policy_to_queue(parameters_queue: Queue, algorithm: RLAlgorithm) 
     # Create a dictionary to hold all the state dicts
     state_dicts = algorithm.get_weights()
     state_bytes = state_to_bytes(state_dicts)
-    parameters_queue.put(state_bytes)
+    try:
+        parameters_queue.put(state_bytes)
+    except (OSError, ValueError):
+        logging.warning("[LEARNER] Failed to push policy parameters (queue closed)")
 
 
 def process_interaction_message(
@@ -959,8 +1218,14 @@ def process_transitions(
         dataset_repo_id: Repository ID for dataset
         shutdown_event: Event to signal shutdown
     """
-    while not transition_queue.empty() and not shutdown_event.is_set():
-        transition_list = transition_queue.get()
+    while not shutdown_event.is_set():
+        try:
+            transition_list = transition_queue.get_nowait()
+        except Empty:
+            break
+        except OSError:
+            break
+
         transition_list = bytes_to_transitions(buffer=transition_list)
 
         for transition in transition_list:
@@ -1000,8 +1265,13 @@ def process_interaction_messages(
         dict | None: The last interaction message processed, or None if none were processed
     """
     last_message = None
-    while not interaction_message_queue.empty() and not shutdown_event.is_set():
-        message = interaction_message_queue.get()
+    while not shutdown_event.is_set():
+        try:
+            message = interaction_message_queue.get_nowait()
+        except Empty:
+            break
+        except OSError:
+            break
         last_message = process_interaction_message(
             message=message,
             interaction_step_shift=interaction_step_shift,

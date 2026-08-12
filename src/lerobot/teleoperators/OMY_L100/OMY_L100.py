@@ -21,6 +21,7 @@ import time
 
 from scipy.spatial.transform import Rotation as R_scipy
 
+from lerobot.robots.crp_arm.ee_gp import EE_OMY_DELTA_SCALE, omy_rh_r1_to_got0, wrap_angle_delta_deg
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
@@ -97,9 +98,18 @@ class OMYL100(Teleoperator):
         self._ee_pose_lock = threading.Lock()
         self._last_ee_pose = None
         self._logged_first_ee_pose = False
+        # HIL EE-delta state (only used when ``config.hil_ee_delta`` is True).
+        self._hil_prev_xyz: tuple[float, float, float] | None = None
+        self._hil_prev_rpy: tuple[float, float, float] | None = None
+        self._hil_keyboard = None
 
     @property
     def action_features(self) -> dict[str, type]:
+        if getattr(self.config, "hil_ee_delta", False):
+            ft: dict[str, type] = {"delta_x": float, "delta_y": float, "delta_z": float}
+            if getattr(self.config, "hil_use_gripper", True):
+                ft["gripper"] = float
+            return ft
         ft = {f"{joint}.pos": joint_type for joint, joint_type in self.OMY_joints.items()}
         if self.config.ros_gripper_joint_name:
             ft["gripper.pos"] = float
@@ -186,7 +196,7 @@ class OMYL100(Teleoperator):
                         self._last_ee_pose = msg
                     if not self._logged_first_ee_pose:
                         self._logged_first_ee_pose = True
-                        logger.info(
+                        logger.debug(
                             "%s first %s on %r QoS=%s (get_ros_end_effector_xyz_rpy_deg ready)",
                             self,
                             ee_label,
@@ -212,6 +222,18 @@ class OMYL100(Teleoperator):
 
         # Run any configuration steps
         self.configure()
+        if getattr(self.config, "hil_ee_delta", False):
+            from lerobot.teleoperators.keyboard_hil_events import KeyboardHilEvents
+
+            self._hil_keyboard = KeyboardHilEvents(
+                intervene_key=getattr(self.config, "hil_intervene_key", "space"),
+                success_key=getattr(self.config, "hil_success_key", "s"),
+                failure_key=getattr(self.config, "hil_failure_key", "f"),
+                rerecord_key=getattr(self.config, "hil_rerecord_key", "r"),
+                reset_pause_key=getattr(self.config, "hil_reset_pause_key", None),
+            )
+            self._hil_keyboard.start()
+            self.reset_reference()
         logger.info(f"{self} connected.")
 
 
@@ -226,8 +248,82 @@ class OMYL100(Teleoperator):
     def configure(self) -> None:
         pass
 
+    def get_gripper_raw(self) -> float:
+        """Return OMY gripper joint raw value (same source as recording → ``omy_rh_r1_to_got0``)."""
+        joints = self._get_joint_action()
+        return float(joints.get("gripper.pos", 0.0))
+
+    def reset_reference(self) -> None:
+        """Latch HIL EE reference so the next ``get_action`` incremental delta starts from zero."""
+        ee = self.get_ros_end_effector_xyz_rpy_deg()
+        if ee is None:
+            self._hil_prev_xyz = None
+            self._hil_prev_rpy = None
+            return
+        self._hil_prev_xyz = tuple(float(v) for v in ee[0])
+        self._hil_prev_rpy = tuple(float(v) for v in ee[1])
+
+    def get_teleop_events(self) -> dict:
+        """HIL control events from the shared keyboard helper (requires ``hil_ee_delta``)."""
+        from lerobot.teleoperators.utils import TeleopEvents
+
+        if self._hil_keyboard is None:
+            return {
+                TeleopEvents.IS_INTERVENTION: False,
+                TeleopEvents.TERMINATE_EPISODE: False,
+                TeleopEvents.SUCCESS: False,
+                TeleopEvents.RERECORD_EPISODE: False,
+            }
+        return self._hil_keyboard.consume_events()
 
     def get_action(self) -> dict[str, float]:
+        """Return joint positions, or HIL EE deltas when ``hil_ee_delta`` is enabled."""
+        if getattr(self.config, "hil_ee_delta", False):
+            return self._get_hil_ee_delta_action()
+        return self._get_joint_action()
+
+    def _get_hil_ee_delta_action(self) -> dict[str, float]:
+        """Incremental EE xyz+rpy delta (+ optional gripper) for HIL-SERL EE action space."""
+        ee = self.get_ros_end_effector_xyz_rpy_deg()
+        norm = float(getattr(self.config, "hil_ee_delta_norm", 1.0) or 1.0)
+        if ee is None:
+            action = {
+                "delta_x": 0.0,
+                "delta_y": 0.0,
+                "delta_z": 0.0,
+                "delta_roll": 0.0,
+                "delta_pitch": 0.0,
+                "delta_yaw": 0.0,
+            }
+        else:
+            xyz = tuple(float(v) for v in ee[0])
+            rpy = tuple(float(v) for v in ee[1])
+            if self._hil_prev_xyz is None or self._hil_prev_rpy is None:
+                self._hil_prev_xyz = xyz
+                self._hil_prev_rpy = rpy
+                dxyz = (0.0, 0.0, 0.0)
+                drpy = (0.0, 0.0, 0.0)
+            else:
+                dxyz = tuple(
+                    EE_OMY_DELTA_SCALE * (xyz[i] - self._hil_prev_xyz[i]) / norm for i in range(3)
+                )
+                drpy = tuple(wrap_angle_delta_deg(rpy[i], self._hil_prev_rpy[i]) / norm for i in range(3))
+                self._hil_prev_xyz = xyz
+                self._hil_prev_rpy = rpy
+            action = {
+                "delta_x": dxyz[0],
+                "delta_y": dxyz[1],
+                "delta_z": dxyz[2],
+                "delta_roll": drpy[0],
+                "delta_pitch": drpy[1],
+                "delta_yaw": drpy[2],
+            }
+
+        if getattr(self.config, "hil_use_gripper", True):
+            action["gripper"] = float(omy_rh_r1_to_got0(self.get_gripper_raw()))
+        return action
+
+    def _get_joint_action(self) -> dict[str, float]:
         """Return latest joint positions from `sensor_msgs/JointState` (degrees when `use_degrees` is True).
 
         Only scans ``JointState`` for the arm (+ optional gripper) names. Avoids ``dict(zip(all names))``:
@@ -302,6 +398,9 @@ class OMYL100(Teleoperator):
             pose = getattr(m, "pose", m)
             p = pose.position
             q = pose.orientation
+        x = float(p.x) * scale
+        y = float(p.y) * scale
+        z = float(p.z) * scale
         roll, pitch, yaw = R_scipy.from_quat([float(q.x), float(q.y), float(q.z), float(q.w)]).as_euler(
             "xyz", degrees=True
         )
@@ -315,6 +414,13 @@ class OMYL100(Teleoperator):
     def disconnect(self) -> None:
         if not self.is_connected:
             DeviceNotConnectedError(f"{self} is not connected.")
+
+        if self._hil_keyboard is not None:
+            try:
+                self._hil_keyboard.stop()
+            except Exception:
+                logger.exception("%s failed to stop HIL keyboard", self)
+            self._hil_keyboard = None
 
         # stop ROS spin thread and destroy node
         try:
@@ -331,5 +437,7 @@ class OMYL100(Teleoperator):
             self._ros_thread = None
             self._ros_node = None
             self._logged_first_ee_pose = False
+            self._hil_prev_xyz = None
+            self._hil_prev_rpy = None
 
         logger.info(f"{self} disconnected.")

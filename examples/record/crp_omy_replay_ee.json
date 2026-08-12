@@ -1,0 +1,27 @@
+{
+  "robot": {
+    "type": "crp_arm",
+    "port": "192.168.0.100",
+    "use_gripper_feature": true,
+    "max_relative_target": null,
+    "speed_ratio_on_connect": 80,
+    "cameras": {},
+    "enable_joint": false,
+    "enable_ee": true,
+    "motion_mode_gi_index": 55,
+    "gp_mode_gi_value": 1,
+    "gj_mode_gi_value": 0,
+    "motion_enable_gi_index": 56,
+    "motion_enable_on_value": 1,
+    "motion_enable_off_value": 0
+  },
+  "dataset": {
+    "repo_id": "dataset/Insert_blue_tube_zyy",
+    "root": "/home/dingyuxuan/zyy/lerobot/outputs/Insert_blue_tube_zyy_0807_ee",
+    "episode": 0,
+    "fps": 30
+  },
+  "play_sounds": true,
+  "speed_ratio": 80,
+  "enable_motion_gate": true
+}

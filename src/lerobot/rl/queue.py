@@ -16,13 +16,30 @@
 
 import platform
 from contextlib import suppress
-from queue import Empty
+from queue import Empty, Full
 from typing import Any
 
 from torch.multiprocessing import Queue
 
 
+def safe_queue_put(queue: Queue, item: Any, block: bool = True, timeout: float | None = None) -> bool:
+    """Put an item on a queue, returning False if the queue is closed/full instead of raising."""
+    try:
+        if timeout is None and block:
+            queue.put(item)
+        else:
+            queue.put(item, block=block, timeout=timeout)
+        return True
+    except (OSError, ValueError, Full):
+        return False
+
+
 def get_last_item_from_queue(queue: Queue, block=True, timeout: float = 0.1) -> Any:
+    """Drain a queue and return the most recent item.
+
+    Raises:
+        OSError: If the underlying queue handle is already closed.
+    """
     if block:
         try:
             item = queue.get(timeout=timeout)
@@ -41,12 +58,17 @@ def get_last_item_from_queue(queue: Queue, block=True, timeout: float = 0.1) -> 
                 item = queue.get_nowait()
         except Empty:
             pass
+        except OSError:
+            raise
 
         return item
 
     # Details about using qsize in https://github.com/huggingface/lerobot/issues/1523
-    while queue.qsize() > 0:
-        with suppress(Empty):
-            item = queue.get_nowait()
+    try:
+        while queue.qsize() > 0:
+            with suppress(Empty):
+                item = queue.get_nowait()
+    except OSError:
+        raise
 
     return item

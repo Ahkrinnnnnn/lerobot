@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
@@ -466,10 +466,36 @@ class InterventionActionProcessorStep(ProcessorStep):
         use_gripper: Whether to include the gripper in the teleoperated action.
         terminate_on_success: If True, automatically sets the `done` flag when a
                               `success` event is received.
+        action_space: ``ee`` uses teleop ``delta_x/y/z``; ``joint`` reads CRP joint
+            positions from ``robot`` (aligns with joint-space IL datasets).
+        robot: Required when ``action_space="joint"`` to read CRP joints.
+        joint_names: Motor base names for joint-space override (default j1..j6).
     """
 
     use_gripper: bool = False
     terminate_on_success: bool = True
+    action_space: str = "ee"
+    robot: Any | None = None
+    joint_names: list[str] = field(default_factory=lambda: ["j1", "j2", "j3", "j4", "j5", "j6"])
+    # When ``action_space="ee"``, include δroll/pitch/yaw in the teleop override tensor.
+    include_rpy: bool = True
+
+    def _joint_action_from_robot(self, action: PolicyAction) -> PolicyAction:
+        if self.robot is None:
+            raise ValueError("InterventionActionProcessorStep(action_space='joint') requires robot")
+        try:
+            obs = self.robot.get_observation(include_images=False)
+        except TypeError:
+            obs = self.robot.get_observation()
+        values = [float(obs.get(f"{name}.pos", 0.0)) for name in self.joint_names]
+        if self.use_gripper:
+            if "gripper.pos" in obs:
+                values.append(float(obs["gripper.pos"]))
+            elif hasattr(self.robot, "get_GOT"):
+                values.append(float(self.robot.get_GOT(0)))
+            else:
+                values.append(0.0)
+        return torch.tensor(values, dtype=action.dtype, device=action.device)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -499,21 +525,33 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         # Override action if intervention is active
         if is_intervention and teleop_action is not None:
-            if isinstance(teleop_action, dict):
-                # Convert teleop_action dict to tensor format
+            if self.action_space == "joint":
+                teleop_action_tensor = self._joint_action_from_robot(action)
+            elif isinstance(teleop_action, dict):
+                # Convert teleop_action dict to tensor format (xyz [+ rpy] + gripper).
                 action_list = [
                     teleop_action.get("delta_x", 0.0),
                     teleop_action.get("delta_y", 0.0),
                     teleop_action.get("delta_z", 0.0),
                 ]
+                if self.include_rpy:
+                    action_list.extend(
+                        [
+                            teleop_action.get("delta_roll", 0.0),
+                            teleop_action.get("delta_pitch", 0.0),
+                            teleop_action.get("delta_yaw", 0.0),
+                        ]
+                    )
                 if self.use_gripper:
                     action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
             elif isinstance(teleop_action, np.ndarray):
-                action_list = teleop_action.tolist()
+                teleop_action_tensor = torch.tensor(
+                    teleop_action.tolist(), dtype=action.dtype, device=action.device
+                )
             else:
-                action_list = teleop_action
+                teleop_action_tensor = torch.as_tensor(teleop_action, dtype=action.dtype, device=action.device)
 
-            teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
 
         # Handle episode termination
@@ -546,6 +584,9 @@ class InterventionActionProcessorStep(ProcessorStep):
         return {
             "use_gripper": self.use_gripper,
             "terminate_on_success": self.terminate_on_success,
+            "action_space": self.action_space,
+            "joint_names": list(self.joint_names),
+            "include_rpy": self.include_rpy,
         }
 
     def transform_features(
